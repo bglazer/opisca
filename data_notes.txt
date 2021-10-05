@@ -1,0 +1,21 @@
+Multiome = ATAC - GEX
+CITE     = ADT - GEX
+
+rna.mod1.X == mod2.mod1.X
+
+CITE = 29077 cells
+Multiome = 16394 cells
+
+RNA->ATAC -- multiome.rna.mod2 = 10k ATAC regions, only need to predict 10k random regions
+ATAC->RNA -- multiome.mod2.mod1 = 116490 ATAC regions, get access to whole 116k regions as input for inference
+
+GEX openproblems_bmmc_cite_phase1_mod2.censor_dataset.output_train_mod1.h5ad **** openproblems_bmmc_cite_phase1_PM_adt2gex
+ADT openproblems_bmmc_cite_phase1_mod2.censor_dataset.output_train_mod2.h5ad **** openproblems_bmmc_cite_phase1_PM_adt2gex
+GEX openproblems_bmmc_multiome_phase1_mod2.censor_dataset.output_train_mod2.h5ad **** openproblems_bmmc_multiome_phase1_PM_atac2gex
+ATAC openproblems_bmmc_multiome_phase1_mod2.censor_dataset.output_train_mod1.h5ad **** openproblems_bmmc_multiome_phase1_PM_atac2gex
+GEX openproblems_bmmc_cite_phase1_rna.censor_dataset.output_train_mod1.h5ad **** openproblems_bmmc_cite_phase1_PM_gex2adt
+ADT openproblems_bmmc_cite_phase1_rna.censor_dataset.output_train_mod2.h5ad **** openproblems_bmmc_cite_phase1_PM_gex2adt
+ATAC openproblems_bmmc_multiome_phase1_rna.censor_dataset.output_train_mod2.h5ad **** openproblems_bmmc_multiome_phase1_PM_gex2atac
+GEX openproblems_bmmc_multiome_phase1_rna.censor_dataset.output_train_mod1.h5ad **** openproblems_bmmc_multiome_phase1_PM_gex2atac
+
+

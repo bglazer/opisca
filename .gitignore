@@ -1,0 +1,6 @@
+*.swp
+.nextflow*
+work/*
+output/*
+sample_data/*
+

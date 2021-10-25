@@ -3,4 +3,8 @@
 work/*
 output/*
 sample_data/*
-
+.ipynb_checkpoints/*
+__pycache__*
+logs/*
+models/*
+input/*

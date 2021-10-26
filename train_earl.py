@@ -164,17 +164,17 @@ class EaRL(torch.nn.Module):
             x_dict = {key: x.relu() for key, x in x_dict.items()}
         return x_dict
 
-    def gene(self, x_dict, edge_index_dict):
-        x_dict = self.encode(x_dict, edge_index_dict)
-        x_dict['p_gene_zero'] = self.sigmoid(self.gene_zero(x_dict['gene']))
-        x_dict['gene_zero'] = Bernoulli(x_dict['p_gene_zero']).sample()
-        x_dict['gene_value'] = self.gene(x_dict['gene'])
-        return x_dict
+    #def gene(self, x_dict, edge_index_dict):
+    #    x_dict = self.encode(x_dict, edge_index_dict)
+    #    x_dict['p_gene_zero'] = self.sigmoid(self.gene_zero(x_dict['gene']))
+    #    x_dict['gene_zero'] = Bernoulli(x_dict['p_gene_zero']).sample()
+    #    x_dict['gene_value'] = self.gene(x_dict['gene'])
+    #    return x_dict
 
-    def atac(self, x_dict, edge_index_dict):
-        x_dict = self.encode(x_dict, edge_index_dict)
-        x_dict['atac_value'] = self.sigmoid(self.atac(x_dict['atac_region']))
-        return x_dict
+    #def atac(self, x_dict, edge_index_dict):
+    #    x_dict = self.encode(x_dict, edge_index_dict)
+    #    x_dict['atac_value'] = self.sigmoid(self.atac(x_dict['atac_region']))
+    #    return x_dict
 
     def protein(self, x_dict, edge_index_dict):
         x_dict = self.encode(x_dict, edge_index_dict)
@@ -209,12 +209,12 @@ params = {
               ('GATConv', {'heads':1, 'in_channels':(-1,-1), 'out_channels':64}), 
               ('GATConv', {'heads':1, 'in_channels':(-1,-1), 'out_channels':64}), 
               ('GATConv', {'heads':1, 'in_channels':(-1,-1), 'out_channels':64})],
-              #('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128}),
-              #('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128}),
-              #('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128}),
-              #('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128})],
+    #'layers':[('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128}),
+    #          ('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128}),
+    #          ('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128}),
+    #          ('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128})],
     'train_batch_size':1,
-    'validation_batch_size': 100,
+    'validation_batch_size': 1,
     'device': device,
 }
 
@@ -290,30 +290,43 @@ def predict(earl, idxs, mask, eval=False):
 
         return predictions, p_zeros, zero_ones, ys
 
+def chunks(lst, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+batches = chunks(train_idxs, train_batch_size)
+
 for epoch in range(n_epochs):
     print(f'Epoch: {epoch}', file=log)
     mask = graph['protein_name']['mask']
-    batch_start = 0
-    batch_end = train_batch_size
     
-    batch_idx = 0
-    while batch_end < len(cell_idxs)+train_batch_size:
+    for batch_idx, batch in enumerate(batches):
         optimizer.zero_grad()
-        predictions, p_zeros, zero_ones, ys = predict(earl, train_idxs[batch_start:batch_end], mask)
-        y_zero_one = ys > .00001
-        zero_one_loss = bce_loss(p_zeros, y_zero_one.float())
-        value_loss = ((predictions[y_zero_one] - ys[y_zero_one])**2).mean()
-        prediction_loss = float(((predictions*zero_ones - ys)**2).mean())
-        loss = zero_one_loss + value_loss
+        batch_zero_one_loss = 0.0
+        batch_value_loss = 0.0
+        batch_prediction_loss = 0.0
+        for idx in batch:
+            predictions, p_zeros, zero_ones, ys = predict(earl, [idx], mask)
+            y_zero_one = ys > .00001
+            zero_one_loss = bce_loss(p_zeros, y_zero_one.float())
+            value_loss = ((predictions[y_zero_one] - ys[y_zero_one])**2).mean()
+            prediction_loss = float(((predictions*zero_ones - ys)**2).mean())
+            loss = zero_one_loss + value_loss
+            loss.backward()
+
+            batch_zero_one_loss += float(zero_one_loss)/len(batch)
+            batch_value_loss += float(value_loss)/len(batch)
+            batch_prediction_loss += float(prediction_loss)/len(batch)
+
+
         print(f'Batch: {batch_idx}', file=log)
-        print(f'train zero one loss {sqrt(float(zero_one_loss))}', file=log) 
-        print(f'train value loss {sqrt(float(value_loss))}',flush=True, file=log)
-        print(f'train prediction loss {sqrt(prediction_loss)}',flush=True, file=log)
-        loss.backward()
+        print(f'train zero one loss {sqrt(batch_zero_one_loss)}', file=log) 
+        print(f'train value loss {sqrt(batch_value_loss)}',flush=True, file=log)
+        print(f'train prediction loss {sqrt(batch_prediction_loss)}',flush=True, file=log)
         optimizer.step()
-        batch_start += train_batch_size
-        batch_end += train_batch_size
-        batch_idx += 1
+
+        # Checkpoint
         if batch_idx % checkpoint == 0:
             idxs = random.sample(validation_idxs, k=validation_batch_size)
             predictions, p_zeros, zero_ones, ys = predict(earl, idxs, mask, eval=True)
@@ -335,4 +348,6 @@ for epoch in range(n_epochs):
                       file=prediction_log, flush=True)
 
             if validation_loss < best_validation_loss:
+                breakpoint()
                 torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
+

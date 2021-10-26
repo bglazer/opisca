@@ -46,8 +46,8 @@ def proteins_to_idxs(data):
     proteins = data.var.index.to_list()
     for protein_name in proteins:
         protein_name = protein_name.upper()
-        if protein_name in node_idxs['gene_name']:
-            indexes.append(node_idxs['gene_name'][protein_name])
+        if protein_name in node_idxs['protein_name']:
+            indexes.append(node_idxs['protein_name'][protein_name])
         else:
             indexes.append(None)
     return indexes, data.X
@@ -80,7 +80,8 @@ def append_expression(graph, cell_idx):
         
     expression = dict()
 
-    for node_type in ['gene_name', 'gene', 'atac_region']:
+    for node_type in ['protein_name', 'gene', 'atac_region']:
+        # initialize all values to -1
         expression[node_type] = torch.ones((
             len(node_idxs[node_type]),
             1
@@ -92,10 +93,10 @@ def append_expression(graph, cell_idx):
     
     for i in range(protein.shape[1]):
         if protein_idxs[i]:
-            expression['gene_name'][protein_idxs[i]] = protein[:,i]
+            expression['protein_name'][protein_idxs[i]] = protein[:,i]
 
-    newgraph['gene_name'].y = expression['gene_name']
-    newgraph['gene_name'].x = torch.ones((len(node_idxs['gene_name']),1),device=device)*-1
+    newgraph['protein_name'].y = expression['protein_name']
+    newgraph['protein_name'].x = torch.ones((len(node_idxs['protein_name']),1),device=device)*-1
 
     newgraph['gene'].x = torch.cat([
         graph['gene'].x,
@@ -136,8 +137,6 @@ class EaRL(torch.nn.Module):
                 ('atac_region', 'overlaps', 'gene'): layer_type(**params),
                 ('gene', 'rev_overlaps', 'atac_region'): layer_type(**params),
                 ('protein', 'coexpressed', 'protein'): layer_type(**params),
-                #('protein', 'trrust_interacts', 'gene'): layer_type(**params),
-                #('gene', 'rev_trrust_interacts', 'protein'): layer_type(**params),
                 ('protein', 'tf_interacts', 'gene'): layer_type(**params),
                 ('gene', 'rev_tf_interacts', 'protein'): layer_type(**params),
                 ('protein', 'rev_associated', 'gene'): layer_type(**params),
@@ -145,47 +144,82 @@ class EaRL(torch.nn.Module):
             })
 
             self.convs.append(conv)
-        # TODO fiddle with these final layers?
-        self.name_conv = HeteroConv({('protein', 'is_named', 'gene_name'): SAGEConv((-1, -1), 1)})
-        self.zero_conv = HeteroConv({('protein', 'is_named', 'gene_name'): SAGEConv((-1, -1), 1)})
 
-    def forward(self, x_dict, edge_index_dict):
-        #gene_names = x_dict['gene_name']
+        _, last_params = layers[-1]
+        hidden = last_params['out_channels']
+
+        # TODO maybe add a final small MLP after conv?
+        self.protein_layer = HeteroConv({('protein', 'is_named', 'protein_name'): SAGEConv((-1, -1), 1)})
+        self.protein_zero  = HeteroConv({('protein', 'is_named', 'protein_name'): SAGEConv((-1, -1), 1)})
+
+        # TODO maybe make this a small NN?
+        #self.gene_layer = Linear(hidden,1)
+        #self.gene_zero  = Linear(hidden,1)
+
+        #self.atac_layer = Linear(hidden,1)
+
+    def encode(self, x_dict, edge_index_dict):
         for conv in self.convs:
             x_dict = conv(x_dict, edge_index_dict)
             x_dict = {key: x.relu() for key, x in x_dict.items()}
+        return x_dict
 
-        x_dict['gene_name'] = torch.ones((len(node_idxs['gene_name']),1),device=device)*-1
-        #gene_prediction = self.relu(self.name_conv(x_dict, edge_index_dict)['gene_name'])
-        gene_prediction = self.name_conv(x_dict, edge_index_dict)['gene_name']
-        gene_zero_prob = self.sigmoid(self.zero_conv(x_dict, edge_index_dict)['gene_name'])
+    def gene(self, x_dict, edge_index_dict):
+        x_dict = self.encode(x_dict, edge_index_dict)
+        x_dict['p_gene_zero'] = self.sigmoid(self.gene_zero(x_dict['gene']))
+        x_dict['gene_zero'] = Bernoulli(x_dict['p_gene_zero']).sample()
+        x_dict['gene_value'] = self.gene(x_dict['gene'])
+        return x_dict
 
-        x_dict['p_gene_zero'] = gene_zero_prob
-        x_dict['gene_zero'] = Bernoulli(gene_zero_prob).sample()
-        x_dict['gene_value'] = gene_prediction
+    def atac(self, x_dict, edge_index_dict):
+        x_dict = self.encode(x_dict, edge_index_dict)
+        x_dict['atac_value'] = self.sigmoid(self.atac(x_dict['atac_region']))
+        return x_dict
+
+    def protein(self, x_dict, edge_index_dict):
+        x_dict = self.encode(x_dict, edge_index_dict)
+
+        x_dict['protein_name'] = torch.ones((len(node_idxs['protein_name']),1),device=device)*-1
+
+        x_dict['p_protein_zero'] = self.sigmoid(self.protein_zero(x_dict, edge_index_dict)['protein_name'])
+        x_dict['protein_zero'] = Bernoulli(x_dict['p_protein_zero']).sample()
+        x_dict['protein_value'] = self.protein_layer(x_dict, edge_index_dict)['protein_name']
 
         return x_dict
+    
 
 now = datetime.strftime(datetime.now(), format='%Y%m%d-%H%M')
 
-log = open(f'logs/train_earl_{now}.log','w')
-param_file = open(f'logs/earl_params_{now}.json','w')
+# Device is first command line arg
+device=sys.argv[1]
+# Provide anything as a second command line argument after device to log to stdout
+if len(sys.argv) == 3:
+    log = None
+    prediction_log = None
+else:
+    log = open(f'logs/train_earl_{now}.log','w')
+    prediction_log = open(f'logs/train_earl_prediction_sample_{now}.log','w')
+
+
 
 params = {
     'lr':.0005,
     'n_epochs':10,
-    'layers':[#('GATConv', {'heads':2, 'in_channels':(-1,-1), 'out_channels':256}), 
-              ('SAGEConv', {'in_channels':(-1,-1), 'out_channels':256}),
-              ('SAGEConv', {'in_channels':(-1,-1), 'out_channels':256}),
-              ('SAGEConv', {'in_channels':(-1,-1), 'out_channels':256}),
-              ('SAGEConv', {'in_channels':(-1,-1), 'out_channels':256})],
-    'train_batch_size':5,
-    'validation_batch_size': 100
+    'layers':[('GATConv', {'heads':1, 'in_channels':(-1,-1), 'out_channels':64}), 
+              ('GATConv', {'heads':1, 'in_channels':(-1,-1), 'out_channels':64}), 
+              ('GATConv', {'heads':1, 'in_channels':(-1,-1), 'out_channels':64}), 
+              ('GATConv', {'heads':1, 'in_channels':(-1,-1), 'out_channels':64})],
+              #('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128}),
+              #('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128}),
+              #('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128}),
+              #('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128})],
+    'train_batch_size':1,
+    'validation_batch_size': 100,
+    'device': device,
 }
 
-json.dump(params, param_file)
-
-device=sys.argv[1]
+with open(f'logs/earl_params_{now}.json','w') as param_file:
+    json.dump(params, param_file)
 
 graph = torch.load('input/graph_with_embeddings.torch')
 node_idxs = pickle.load(open('input/nodes_by_type.pickle','rb'))
@@ -201,15 +235,15 @@ graph = graph.to('cpu')
 graph = torch_geometric.transforms.ToUndirected()(graph)
 graph = graph.to(device)
 
-protein_mask = torch.zeros((len(node_idxs['gene_name']),1), dtype=bool, device=device)
+protein_mask = torch.zeros((len(node_idxs['protein_name']),1), dtype=bool, device=device)
 protein_mask[protein_idxs] = 1
-graph['gene_name']['mask'] = protein_mask
+graph['protein_name']['mask'] = protein_mask
 
 gene_mask = torch.zeros((len(node_idxs['gene']),1), dtype=bool, device=device)
 gene_mask[[idx for idx in gene_idxs if idx]] = 1
 graph['gene']['mask'] = gene_mask
 
-# ## TODO trim the gene names, we have way more gene names than we have in the data
+# TODO trim the gene names, we have way more gene names than we have in the data
 
 num_cells = gene_expression.shape[0]
 
@@ -248,16 +282,17 @@ def predict(earl, idxs, mask, eval=False):
 
         for i,idx in enumerate(idxs):
             newgraph = append_expression(graph, idx)
-            output = earl(newgraph.x_dict, newgraph.edge_index_dict)
-            predictions[i] = output['gene_value'][mask].flatten()
-            p_zeros[i] = output['p_gene_zero'][mask].flatten()
-            zero_ones[i] = output['gene_zero'][mask].flatten()
-            ys[i] = newgraph['gene_name'].y[mask]
+            output = earl.protein(newgraph.x_dict, newgraph.edge_index_dict)
+            predictions[i] = output['protein_value'][mask].flatten()
+            p_zeros[i] = output['p_protein_zero'][mask].flatten()
+            zero_ones[i] = output['protein_zero'][mask].flatten()
+            ys[i] = newgraph['protein_name'].y[mask]
 
         return predictions, p_zeros, zero_ones, ys
 
 for epoch in range(n_epochs):
-    mask = graph['gene_name']['mask']
+    print(f'Epoch: {epoch}', file=log)
+    mask = graph['protein_name']['mask']
     batch_start = 0
     batch_end = train_batch_size
     
@@ -291,14 +326,13 @@ for epoch in range(n_epochs):
             print(f'validation prediction loss {sqrt(validation_loss)}',flush=True, file=log)
 
             stacked = torch.vstack([predictions[0,:]*zero_ones[0,:], ys[0,:]])
-            prediction_log = open(f'logs/train_earl_prediction_sample_{now}.log','w')
+
+            if prediction_log:
+                prediction_log.truncate(0)
             for i in range(stacked.shape[1]):
-                print(f'batch {batch_idx} {i:<6d} pred,y: {float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', file=prediction_log)
-            prediction_log.flush()
+                print(f'batch {batch_idx} {i:<6d} pred,y: '+
+                      f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
+                      file=prediction_log, flush=True)
 
             if validation_loss < best_validation_loss:
                 torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
-        
-    print(f'Epoch: {epoch}', file=log)
-    torch.save(earl, 'earl.model')
-

@@ -28,8 +28,6 @@ def proteins_to_idxs(data):
         protein_name = protein_name.upper()
         if protein_name in node_idxs['protein_name']:
             indexes.append((i,node_idxs['protein_name'][protein_name]))
-        #else:
-        #    indexes.append(None)
     return tensor(indexes,device=device), data.X
 
 def genes_to_idxs(data):
@@ -38,63 +36,15 @@ def genes_to_idxs(data):
     for i,gene_id in enumerate(genes):
         if gene_id in node_idxs['gene']:
             indexes.append((i,node_idxs['gene'][gene_id]))
-        #else:
-        #    indexes.append(None)
     return tensor(indexes,device=device), data.X
 
-def atac_to_idxs(data):
+def atacs_to_idxs(data):
     indexes = {}
     regions = data.var.index.to_list()
     for i,region in enumerate(regions):
         if region in node_idxs['atac_region']:
             indexes.append((i,node_idxs['atac_region'][region]))
-        #else:
-        #    indexes.append(None)
-    return indexes, data.X
-
-def append_expression(graph, cell_idx):
-    newgraph = HeteroData()
-    
-    gene = tensor(gene_expression[cell_idx].todense())*128
-    protein = tensor(protein_expression[cell_idx].todense())
-        
-    expression = dict()
-
-    for node_type in ['protein_name', 'gene', 'atac_region']:
-        # initialize all values to -1
-        expression[node_type] = torch.ones((
-            len(node_idxs[node_type]),
-            1),device=device)*-1
-    
-    for i in range(gene.shape[1]):
-        if gene_idxs[i]:
-            expression['gene'][gene_idxs[i]] = gene[:,i]
-    
-    for i in range(protein.shape[1]):
-        if protein_idxs[i]:
-            expression['protein_name'][protein_idxs[i]] = protein[:,i]
-
-    newgraph['protein_name'].y = expression['protein_name']
-    newgraph['protein_name'].x = torch.ones((len(node_idxs['protein_name']),1),device=device)*-1
-
-    newgraph['gene'].x = torch.cat([
-        graph['gene'].x,
-        expression['gene']
-    ], dim=1)
-        
-    newgraph['atac_region'].x = torch.cat([
-        graph['atac_region'].x,
-        expression['atac_region']
-    ], dim=1)
-    
-    newgraph['tad'].x = graph['tad'].x
-    newgraph['protein'].x = graph['protein'].x
-    
-    for edge_type, store in graph._edge_store_dict.items():
-        for k,v in store.items():
-            newgraph[edge_type][k]=v
-    
-    return newgraph
+    return tensor(indexes,device=device), data.X
 
 def expand_for_data(graph):
     with torch.no_grad():
@@ -106,18 +56,25 @@ def expand_for_data(graph):
         return graph
         
 
-def add_expression(graph, cell_idx):
+def add_expression(graph, cell_idx, task):
     with torch.no_grad():
-        gene = tensor(gene_expression[cell_idx].todense(),device=device)*128
-        protein = tensor(protein_expression[cell_idx].todense(),device=device)
-
-        graph['gene'].x[gene_idxs[:,1],-1] = gene[0,gene_idxs[:,0]]
-
-        graph['protein_name'].y = torch.ones((len(node_idxs['protein_name']),1), device=device)*-1
-        graph['protein_name'].y[protein_idxs[:,1],-1] = protein[0,protein_idxs[:,0]]
-
         graph['protein_name'].x = torch.ones((len(node_idxs['protein_name']),1), device=device)*-1
-        graph['atac_region'].x[:,-1] = torch.ones((len(node_idxs['atac_region'])), device=device)*-1
+        # 128 is the feature size from the node2vec
+        # multiply by 128 so the expression has roughly the same magnitude as 
+        # the rest of the features combined
+        src_expr = tensor(expression[task][0][cell_idx].todense(),device=device)*128
+        tgt_expr = tensor(expression[task][1][cell_idx].todense(),device=device)
+        src_idxs = idxs[task][0]
+        tgt_idxs = idxs[task][1]
+
+        graph[source].x[src_idxs[:,1],-1] = src_expr[0,src_idxs[:,0]]
+
+        graph[target].y = torch.ones((len(node_idxs[target]),1), device=device)*-1
+        graph[target].y[tgt_idxs[:,1],-1] = tgt_expr[0,tgt_idxs[:,0]]
+
+        for node_type in ['gene','protein_name','atac_region']:
+            if node_type not in (source, target):
+                graph[node_type].x[:,-1] = torch.ones((len(node_idxs[node_type])), device=device)*-1
 
         return graph
     
@@ -147,6 +104,8 @@ class EaRL(torch.nn.Module):
                 ('gene', 'rev_tf_interacts', 'protein'): layer_type(**params, in_channels=(-1,-1)),
                 ('protein', 'rev_associated', 'gene'): layer_type(**params, in_channels=(-1,-1)),
                 ('gene', 'associated', 'protein'): layer_type(**params, in_channels=(-1,-1)),
+                ('protein', 'is_named', 'protein_name'): layer_type(**params, in_channels=(-1,-1)),
+                ('protein_name', 'rev_is_named', 'protein'): layer_type(**params, in_channels=(-1,-1)),
             })
 
             self.convs.append(conv)
@@ -155,7 +114,6 @@ class EaRL(torch.nn.Module):
         last_layer = layer_classes[last_layer]
         hidden = last_params['out_channels']
 
-        # TODO maybe add a final small MLP after conv?
         self.protein_layer = HeteroConv({('protein', 'is_named', 'protein_name'): 
                                         last_layer(in_channels=(-1, -1), **last_params)})
 
@@ -240,27 +198,47 @@ graph.to(device)
 node_idxs = pickle.load(open('input/nodes_by_type.pickle','rb'))
 graph = expand_for_data(graph)
 
-print('Loading data')
+print('Loading protein/gene data')
 datadir = 'output/datasets/predict_modality/openproblems_bmmc_cite_phase1_mod2/'
-protein_data = scanpy.read_h5ad(datadir+'openproblems_bmmc_cite_phase1_mod2.censor_dataset.output_train_mod1.h5ad')
+datafile = 'openproblems_bmmc_cite_phase1_mod2.censor_dataset.output_train_mod1.h5ad'
+protein_data = scanpy.read_h5ad(datadir+datafile)
 protein_idxs, protein_expression = proteins_to_idxs(protein_data)
 
-gene_data = scanpy.read_h5ad(datadir+'openproblems_bmmc_cite_phase1_mod2.censor_dataset.output_train_mod2.h5ad')
+datafile = 'openproblems_bmmc_cite_phase1_mod2.censor_dataset.output_train_mod2.h5ad'
+gene_data = scanpy.read_h5ad(datadir+datafile)
 gene_idxs, gene_expression = genes_to_idxs(gene_data)
+
+expression[('protein','gene')] = (protein_expression,gene_expression)
+idxs[('protein','gene')] = (protein_idxs,gene_idxs)
+expression[('gene','protein')] = (gene_expression,protein_expression)
+idxs[('gene','protein')] = (gene_idxs,protein_idxs)
+
+print('Loading atac/gene data')
+datadir = 'output/datasets/predict_modality/openproblems_bmmc_multiome_phase1_mod2/'
+datafile = 'openproblems_bmmc_multiome_phase1_mod2.censor_dataset.output_train_mod1.h5ad'
+atac_data = scanpy.read_h5ad(datadir+datafile)
+atac_idxs, atac_expression = atacs_to_idxs(atac_data)
+
+datafile = 'openproblems_bmmc_multiome_phase1_mod2.censor_dataset.output_train_mod2.h5ad'
+gene_data = scanpy.read_h5ad(datadir+datafile)
+gene_idxs, gene_expression = genes_to_idxs(gene_data)
+
+expression[('atac','gene')] = (protein_expression,gene_expression)
+idxs[('atac','gene')] = (protein_idxs,gene_idxs)
+expression[('gene','atac')] = (gene_expression,protein_expression)
+idxs[('gene','atac')] = (gene_idxs,protein_idxs)
 
 print('Making graph undirected')
 graph = graph.to('cpu')
 graph = torch_geometric.transforms.ToUndirected()(graph)
 graph = graph.to(device)
 
-protein_mask = torch.zeros((len(node_idxs['protein_name']),1), dtype=bool, device=device)
-protein_mask[protein_idxs[:,1]] = 1
-graph['protein_name']['mask'] = protein_mask
-
-gene_mask = torch.zeros((len(node_idxs['gene']),1), dtype=bool, device=device)
-gene_mask[gene_idxs[:,1]] = 1
-#gene_mask[[idx for idx in gene_idxs if idx]] = 1
-graph['gene']['mask'] = gene_mask
+def set_mask(graph, task):
+    for i,node_type in enumerate(task):
+        mask = torch.zeros((len(node_idxs[node_type]),1), dtype=bool, device=device)
+        mask[idxs[task][i][:,1]] = 1
+        graph[node_type]['mask'] = mask
+    return graph
 
 # TODO trim the gene names, we have way more gene names than we have in the data
 num_cells = gene_expression.shape[0]
@@ -271,14 +249,15 @@ val_set_size = num_cells - train_set_size
 
 print('Initializing EaRL')
 earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'])
-
 earl = earl.to(device)
+
 optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['lr'])
 earl.train()
 
 n_epochs = params['n_epochs']
 checkpoint = params['checkpoint']
 
+# TODO need to do this for each task
 cell_idxs = list(range(gene_expression.shape[0]))
 random.shuffle(cell_idxs)
 train_idxs = cell_idxs[:train_set_size]
@@ -291,6 +270,7 @@ bce_loss = BCELoss()
 
 best_validation_loss = float('inf')
 
+# TODO make this take a task as an input variable
 def predict(earl, idxs, mask, eval=False):
     with torch.inference_mode(eval):
         num_predictions = len(idxs)
@@ -315,11 +295,18 @@ def chunks(lst, n):
         yield lst[i:i + n]
 
 print('Starting training')
+# TODO setting up batches for each task??
+# TODO randomized sequence for each task? 
+# TODO 
 for epoch in range(n_epochs):
     batches = chunks(train_idxs, train_batch_size)
     print(f'Epoch: {epoch}', file=log)
     mask = graph['protein_name']['mask']
     
+    # TODO MAML here?
+    # TODO for task in expression:
+    # TODO     graph = set_mask(graph, task)
+    # TODO     setting up expression data
     for batch_idx, batch in enumerate(batches):
         earl.train()
         optimizer.zero_grad()

@@ -24,32 +24,32 @@ from torch_geometric.graphgym.models import MLP
 def proteins_to_idxs(data):
     indexes = []
     proteins = data.var.index.to_list()
-    for protein_name in proteins:
+    for i,protein_name in enumerate(proteins):
         protein_name = protein_name.upper()
         if protein_name in node_idxs['protein_name']:
-            indexes.append(node_idxs['protein_name'][protein_name])
-        else:
-            indexes.append(None)
-    return indexes, data.X
+            indexes.append((i,node_idxs['protein_name'][protein_name]))
+        #else:
+        #    indexes.append(None)
+    return tensor(indexes,device=device), data.X
 
 def genes_to_idxs(data):
     indexes = []
     genes = data.var['gene_ids'].to_list()
-    for gene_id in genes:
+    for i,gene_id in enumerate(genes):
         if gene_id in node_idxs['gene']:
-            indexes.append(node_idxs['gene'][gene_id])
-        else:
-            indexes.append(None)
-    return indexes, data.X
+            indexes.append((i,node_idxs['gene'][gene_id]))
+        #else:
+        #    indexes.append(None)
+    return tensor(indexes,device=device), data.X
 
 def atac_to_idxs(data):
     indexes = {}
     regions = data.var.index.to_list()
-    for region in regions:
+    for i,region in enumerate(regions):
         if region in node_idxs['atac_region']:
-            indexes.append(node_idxs['atac_region'][region])
-        else:
-            indexes.append(None)
+            indexes.append((i,node_idxs['atac_region'][region]))
+        #else:
+        #    indexes.append(None)
     return indexes, data.X
 
 def append_expression(graph, cell_idx):
@@ -96,7 +96,48 @@ def append_expression(graph, cell_idx):
     
     return newgraph
 
+def expand_for_data(graph):
+    with torch.no_grad():
+        for node_type in ['gene', 'atac_region']:
+            graph[node_type].x = torch.cat([
+                graph[node_type].x,
+                torch.ones((len(node_idxs[node_type]),1),device=device)
+            ], dim=1)
+        return graph
+        
 
+def add_expression(graph, cell_idx):
+    with torch.no_grad():
+        gene = tensor(gene_expression[cell_idx].todense(),device=device)*128
+        protein = tensor(protein_expression[cell_idx].todense(),device=device)
+
+        graph['gene'].x[gene_idxs[:,1],-1] = gene[0,gene_idxs[:,0]]
+
+        graph['protein_name'].y = torch.ones((len(node_idxs['protein_name']),1), device=device)*-1
+        graph['protein_name'].y[protein_idxs[:,1],-1] = protein[0,protein_idxs[:,0]]
+
+        #n_genes = len(node_idxs['gene'])
+        #n_atac_region = len(node_idxs['atac_region'])
+        #n_protein_names = len(node_idxs['protein_name'])
+        #_genes = np.ones((n_genes,))*-1
+        #_proteins = np.ones((n_protein_names,))*-1
+
+        #for i in range(gene.shape[1]):
+        #    if gene_idxs[i]:
+        #        _genes[gene_idxs[i]] = gene[0,i]
+        #graph['gene'].x[:,-1] = tensor(_genes)
+        
+
+        #for i in range(protein.shape[1]):
+        #    if protein_idxs[i]:
+        #        _proteins[protein_idxs[i]] = protein[0,i]
+        #graph['protein_name'].y = _proteins
+
+        graph['protein_name'].x = torch.ones((len(node_idxs['protein_name']),1), device=device)*-1
+        graph['atac_region'].x[:,-1] = torch.ones((len(node_idxs['atac_region'])), device=device)*-1
+
+        return graph
+    
 
 class EaRL(torch.nn.Module):
     def __init__(self, gnn_layers, out_mlp):
@@ -212,7 +253,10 @@ if log:
         json.dump(params, param_file)
 
 graph = torch.load('input/graph_with_embeddings.torch')
+graph.to(device)
+
 node_idxs = pickle.load(open('input/nodes_by_type.pickle','rb'))
+graph = expand_for_data(graph)
 
 datadir = 'output/datasets/predict_modality/openproblems_bmmc_cite_phase1_mod2/'
 protein_data = scanpy.read_h5ad(datadir+'openproblems_bmmc_cite_phase1_mod2.censor_dataset.output_train_mod1.h5ad')
@@ -226,15 +270,20 @@ graph = torch_geometric.transforms.ToUndirected()(graph)
 graph = graph.to(device)
 
 protein_mask = torch.zeros((len(node_idxs['protein_name']),1), dtype=bool, device=device)
-protein_mask[protein_idxs] = 1
+protein_mask[protein_idxs[:,0]] = 1
 graph['protein_name']['mask'] = protein_mask
 
 gene_mask = torch.zeros((len(node_idxs['gene']),1), dtype=bool, device=device)
-gene_mask[[idx for idx in gene_idxs if idx]] = 1
+gene_mask[gene_idxs[:,0]] = 1
+#gene_mask[[idx for idx in gene_idxs if idx]] = 1
 graph['gene']['mask'] = gene_mask
 
-# TODO trim the gene names, we have way more gene names than we have in the data
+from timeit import timeit
 
+#print(timeit('append_expression(graph, random.sample(range(100),k=1))', globals=globals(), number=100))
+#print(timeit('add_expression(graph, random.sample(range(100),k=1))', globals=globals(), number=100))
+
+# TODO trim the gene names, we have way more gene names than we have in the data
 num_cells = gene_expression.shape[0]
 
 train_set_size = int(num_cells*.7)
@@ -271,7 +320,7 @@ def predict(earl, idxs, mask, eval=False):
         ys = torch.zeros((num_predictions, mask.sum()), device=device)
 
         for i,idx in enumerate(idxs):
-            newgraph = append_expression(graph, idx)
+            newgraph = add_expression(graph, idx)
             output = earl.protein(newgraph.x_dict, newgraph.edge_index_dict)
             predictions[i] = output['protein_value'][mask].flatten()
             p_zeros[i] = output['p_protein_zero'][mask].flatten()
@@ -285,9 +334,8 @@ def chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
-batches = chunks(train_idxs, train_batch_size)
-
 for epoch in range(n_epochs):
+    batches = chunks(train_idxs, train_batch_size)
     print(f'Epoch: {epoch}', file=log)
     mask = graph['protein_name']['mask']
     

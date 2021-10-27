@@ -13,7 +13,7 @@ import random
 from collections import Counter
 import torch.nn.functional as F
 from torch.nn import Linear, LeakyReLU, Sigmoid, BCELoss
-from torch_geometric.nn import GATConv, HeteroConv, SAGEConv
+from torch_geometric.nn import GATConv, HeteroConv, SAGEConv, GATv2Conv, TransformerConv
 from torch_geometric.data import HeteroData
 import torch_geometric
 from torch import tensor
@@ -130,7 +130,8 @@ class EaRL(torch.nn.Module):
         self.sigmoid = Sigmoid()
         # This is a little shim that gets around us not being able to json dump 
         # the class of the layer (i.e GATConv) in the param dictionary
-        layer_classes = {'GATConv':GATConv, 'SAGEConv':SAGEConv}
+        layer_classes = {'GATConv':GATConv, 'SAGEConv':SAGEConv,
+                         'TransformerConv':TransformerConv}
         for layer_type, params in gnn_layers:
             layer_type = layer_classes[layer_type]
             conv = HeteroConv({
@@ -198,6 +199,7 @@ class EaRL(torch.nn.Module):
         return x_dict
     
 
+print('Starting')
 now = datetime.strftime(datetime.now(), format='%Y%m%d-%H%M')
 print(now)
 
@@ -216,14 +218,10 @@ else:
 params = {
     'lr':.001,
     'n_epochs':10,
-    #'layers':[('GATConv', {'heads':2, 'out_channels':64}), 
-    #          ('GATConv', {'heads':2, 'out_channels':64}), 
-    #          ('GATConv', {'heads':2, 'out_channels':64}), 
-    'layers':[('SAGEConv', {'out_channels':256}),
-              ('SAGEConv', {'out_channels':256}),
-              ('SAGEConv', {'out_channels':256}),
-              ('SAGEConv', {'out_channels':256})],
-    'out_mlp':{'dim_in':256, 'dim_out':1, 'bias':True, 
+    'layers':[('SAGEConv', {'out_channels':128}),
+              ('SAGEConv', {'out_channels':128}),
+              ('TransformerConv', {'out_channels':32, 'heads':2})],
+    'out_mlp':{'dim_in':64, 'dim_out':1, 'bias':True, 
                'dim_inner': 512, 'num_layers':3},
     'train_batch_size': 20,
     'validation_batch_size': 100,
@@ -235,12 +233,14 @@ if log:
     with open(f'logs/earl_params_{now}.json','w') as param_file:
         json.dump(params, param_file)
 
+print('Loading graph')
 graph = torch.load('input/graph_with_embeddings.torch')
 graph.to(device)
 
 node_idxs = pickle.load(open('input/nodes_by_type.pickle','rb'))
 graph = expand_for_data(graph)
 
+print('Loading data')
 datadir = 'output/datasets/predict_modality/openproblems_bmmc_cite_phase1_mod2/'
 protein_data = scanpy.read_h5ad(datadir+'openproblems_bmmc_cite_phase1_mod2.censor_dataset.output_train_mod1.h5ad')
 protein_idxs, protein_expression = proteins_to_idxs(protein_data)
@@ -248,23 +248,19 @@ protein_idxs, protein_expression = proteins_to_idxs(protein_data)
 gene_data = scanpy.read_h5ad(datadir+'openproblems_bmmc_cite_phase1_mod2.censor_dataset.output_train_mod2.h5ad')
 gene_idxs, gene_expression = genes_to_idxs(gene_data)
 
+print('Making graph undirected')
 graph = graph.to('cpu')
 graph = torch_geometric.transforms.ToUndirected()(graph)
 graph = graph.to(device)
 
 protein_mask = torch.zeros((len(node_idxs['protein_name']),1), dtype=bool, device=device)
-protein_mask[protein_idxs[:,0]] = 1
+protein_mask[protein_idxs[:,1]] = 1
 graph['protein_name']['mask'] = protein_mask
 
 gene_mask = torch.zeros((len(node_idxs['gene']),1), dtype=bool, device=device)
-gene_mask[gene_idxs[:,0]] = 1
+gene_mask[gene_idxs[:,1]] = 1
 #gene_mask[[idx for idx in gene_idxs if idx]] = 1
 graph['gene']['mask'] = gene_mask
-
-from timeit import timeit
-
-#print(timeit('append_expression(graph, random.sample(range(100),k=1))', globals=globals(), number=100))
-#print(timeit('add_expression(graph, random.sample(range(100),k=1))', globals=globals(), number=100))
 
 # TODO trim the gene names, we have way more gene names than we have in the data
 num_cells = gene_expression.shape[0]
@@ -273,6 +269,7 @@ train_set_size = int(num_cells*.7)
 
 val_set_size = num_cells - train_set_size
 
+print('Initializing EaRL')
 earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'])
 
 earl = earl.to(device)
@@ -317,6 +314,7 @@ def chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
+print('Starting training')
 for epoch in range(n_epochs):
     batches = chunks(train_idxs, train_batch_size)
     print(f'Epoch: {epoch}', file=log)
@@ -342,9 +340,9 @@ for epoch in range(n_epochs):
             batch_prediction_loss += float(prediction_loss)/len(batch)
 
         print(f'Batch: {batch_idx}', file=log)
-        print(f'train zero one loss {sqrt(batch_zero_one_loss)}', file=log) 
-        print(f'train value loss {sqrt(batch_value_loss)}',flush=True, file=log)
-        print(f'train prediction loss {sqrt(batch_prediction_loss)}',flush=True, file=log)
+        print(f'train zero one loss {batch_zero_one_loss}', file=log) 
+        print(f'train value loss {batch_value_loss}',flush=True, file=log)
+        print(f'train prediction loss {batch_prediction_loss}',flush=True, file=log)
         optimizer.step()
 
         # Checkpoint
@@ -356,9 +354,9 @@ for epoch in range(n_epochs):
             zero_one_loss = bce_loss(p_zeros, y_zero_one.float())
             value_loss = ((predictions[y_zero_one] - ys[y_zero_one])**2).mean()
             validation_loss = float(((predictions*zero_ones - ys)**2).mean())
-            print(f'validation zero one loss {sqrt(float(zero_one_loss))}', file=log) 
-            print(f'validation value loss {sqrt(float(value_loss))}',flush=True, file=log)
-            print(f'validation prediction loss {sqrt(validation_loss)}',flush=True, file=log)
+            print(f'validation zero one loss {float(zero_one_loss)}', file=log) 
+            print(f'validation value loss {float(value_loss)}',flush=True, file=log)
+            print(f'validation prediction loss {validation_loss}',flush=True, file=log)
 
             stacked = torch.vstack([predictions[0,:]*zero_ones[0,:], ys[0,:]])
 
@@ -369,6 +367,6 @@ for epoch in range(n_epochs):
                       f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
                       file=prediction_log, flush=True)
 
-            if validation_loss < best_validation_loss:
+            if validation_loss < best_validation_loss and log:
                 torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
 

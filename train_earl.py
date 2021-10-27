@@ -18,27 +18,7 @@ from torch_geometric.data import HeteroData
 import torch_geometric
 from torch import tensor
 from torch.distributions import Bernoulli
-
-
-# ## EARL = Expression and Representation Learner
-
-# ✓ For each cell, create a data vector.
-# 
-# ✓ Data level batching
-# 
-# Graph level batching (is this necessary?)
-# 
-# ✓ Metapath or TransE for featureless (all) nodes?
-# 
-# Random masking (self supervision)
-# 
-# ✓ Backprop loss of just unknown
-# 
-# ✓ Make most graphs undirected. Remove incoming edges to known nodes?
-# 
-# ✓ Create a GNN
-# 
-# Train GNN
+from torch_geometric.graphgym.models import MLP
 
 
 def proteins_to_idxs(data):
@@ -84,8 +64,7 @@ def append_expression(graph, cell_idx):
         # initialize all values to -1
         expression[node_type] = torch.ones((
             len(node_idxs[node_type]),
-            1
-        ),device=device)*-1
+            1),device=device)*-1
     
     for i in range(gene.shape[1]):
         if gene_idxs[i]:
@@ -118,8 +97,9 @@ def append_expression(graph, cell_idx):
     return newgraph
 
 
+
 class EaRL(torch.nn.Module):
-    def __init__(self, layers):
+    def __init__(self, gnn_layers, out_mlp):
         super().__init__()
 
         self.convs = torch.nn.ModuleList()
@@ -127,30 +107,35 @@ class EaRL(torch.nn.Module):
         # This is a little shim that gets around us not being able to json dump 
         # the class of the layer (i.e GATConv) in the param dictionary
         layer_classes = {'GATConv':GATConv, 'SAGEConv':SAGEConv}
-        for layer_type, params in layers:
+        for layer_type, params in gnn_layers:
             layer_type = layer_classes[layer_type]
             conv = HeteroConv({
-                ('tad', 'overlaps', 'atac_region'): layer_type(**params),
-                ('atac_region', 'rev_overlaps', 'tad'): layer_type(**params),
-                ('tad', 'overlaps', 'gene'): layer_type(**params),
-                ('gene', 'rev_overlaps', 'tad'): layer_type(**params),
-                ('atac_region', 'overlaps', 'gene'): layer_type(**params),
-                ('gene', 'rev_overlaps', 'atac_region'): layer_type(**params),
-                ('protein', 'coexpressed', 'protein'): layer_type(**params),
-                ('protein', 'tf_interacts', 'gene'): layer_type(**params),
-                ('gene', 'rev_tf_interacts', 'protein'): layer_type(**params),
-                ('protein', 'rev_associated', 'gene'): layer_type(**params),
-                ('gene', 'associated', 'protein'): layer_type(**params),
+                ('tad', 'overlaps', 'atac_region'): layer_type(**params, in_channels=(-1,-1)),
+                ('atac_region', 'rev_overlaps', 'tad'): layer_type(**params, in_channels=(-1,-1)),
+                ('tad', 'overlaps', 'gene'): layer_type(**params, in_channels=(-1,-1)),
+                ('gene', 'rev_overlaps', 'tad'): layer_type(**params, in_channels=(-1,-1)),
+                ('atac_region', 'overlaps', 'gene'): layer_type(**params, in_channels=(-1,-1)),
+                ('gene', 'rev_overlaps', 'atac_region'): layer_type(**params, in_channels=(-1,-1)),
+                # Not bipartite so we have just (-1) for in channels, same feature sizes for both
+                ('protein', 'coexpressed', 'protein'): layer_type(**params, in_channels=-1),
+                ('protein', 'tf_interacts', 'gene'): layer_type(**params, in_channels=(-1,-1)),
+                ('gene', 'rev_tf_interacts', 'protein'): layer_type(**params, in_channels=(-1,-1)),
+                ('protein', 'rev_associated', 'gene'): layer_type(**params, in_channels=(-1,-1)),
+                ('gene', 'associated', 'protein'): layer_type(**params, in_channels=(-1,-1)),
             })
 
             self.convs.append(conv)
 
-        _, last_params = layers[-1]
+        last_layer, last_params = gnn_layers[-1]
+        last_layer = layer_classes[last_layer]
         hidden = last_params['out_channels']
 
         # TODO maybe add a final small MLP after conv?
-        self.protein_layer = HeteroConv({('protein', 'is_named', 'protein_name'): SAGEConv((-1, -1), 1)})
-        self.protein_zero  = HeteroConv({('protein', 'is_named', 'protein_name'): SAGEConv((-1, -1), 1)})
+        self.protein_layer = HeteroConv({('protein', 'is_named', 'protein_name'): 
+                                        last_layer(in_channels=(-1, -1), **last_params)})
+
+        self.protein_zero  = MLP(**out_mlp) 
+        self.protein_value = MLP(**out_mlp)
 
         # TODO maybe make this a small NN?
         #self.gene_layer = Linear(hidden,1)
@@ -181,14 +166,16 @@ class EaRL(torch.nn.Module):
 
         x_dict['protein_name'] = torch.ones((len(node_idxs['protein_name']),1),device=device)*-1
 
-        x_dict['p_protein_zero'] = self.sigmoid(self.protein_zero(x_dict, edge_index_dict)['protein_name'])
+        protein_name_embedding = self.protein_layer(x_dict, edge_index_dict)['protein_name']
+        x_dict['p_protein_zero'] = self.sigmoid(self.protein_zero(protein_name_embedding))
         x_dict['protein_zero'] = Bernoulli(x_dict['p_protein_zero']).sample()
-        x_dict['protein_value'] = self.protein_layer(x_dict, edge_index_dict)['protein_name']
+        x_dict['protein_value'] = self.protein_value(protein_name_embedding)
 
         return x_dict
     
 
 now = datetime.strftime(datetime.now(), format='%Y%m%d-%H%M')
+print(now)
 
 # Device is first command line arg
 device=sys.argv[1]
@@ -203,23 +190,26 @@ else:
 
 
 params = {
-    'lr':.0005,
+    'lr':.001,
     'n_epochs':10,
-    'layers':[('GATConv', {'heads':1, 'in_channels':(-1,-1), 'out_channels':64}), 
-              ('GATConv', {'heads':1, 'in_channels':(-1,-1), 'out_channels':64}), 
-              ('GATConv', {'heads':1, 'in_channels':(-1,-1), 'out_channels':64}), 
-              ('GATConv', {'heads':1, 'in_channels':(-1,-1), 'out_channels':64})],
-    #'layers':[('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128}),
-    #          ('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128}),
-    #          ('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128}),
-    #          ('SAGEConv', {'in_channels':(-1,-1), 'out_channels':128})],
-    'train_batch_size':1,
-    'validation_batch_size': 1,
+    #'layers':[('GATConv', {'heads':2, 'out_channels':64}), 
+    #          ('GATConv', {'heads':2, 'out_channels':64}), 
+    #          ('GATConv', {'heads':2, 'out_channels':64}), 
+    'layers':[('SAGEConv', {'out_channels':256}),
+              ('SAGEConv', {'out_channels':256}),
+              ('SAGEConv', {'out_channels':256}),
+              ('SAGEConv', {'out_channels':256})],
+    'out_mlp':{'dim_in':256, 'dim_out':1, 'bias':True, 
+               'dim_inner': 512, 'num_layers':3},
+    'train_batch_size': 20,
+    'validation_batch_size': 100,
+    'checkpoint': 50,
     'device': device,
 }
 
-with open(f'logs/earl_params_{now}.json','w') as param_file:
-    json.dump(params, param_file)
+if log:
+    with open(f'logs/earl_params_{now}.json','w') as param_file:
+        json.dump(params, param_file)
 
 graph = torch.load('input/graph_with_embeddings.torch')
 node_idxs = pickle.load(open('input/nodes_by_type.pickle','rb'))
@@ -251,14 +241,14 @@ train_set_size = int(num_cells*.7)
 
 val_set_size = num_cells - train_set_size
 
-earl = EaRL(layers=params['layers'])
+earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'])
 
 earl = earl.to(device)
 optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['lr'])
 earl.train()
 
 n_epochs = params['n_epochs']
-checkpoint = 10
+checkpoint = params['checkpoint']
 
 cell_idxs = list(range(gene_expression.shape[0]))
 random.shuffle(cell_idxs)
@@ -302,6 +292,7 @@ for epoch in range(n_epochs):
     mask = graph['protein_name']['mask']
     
     for batch_idx, batch in enumerate(batches):
+        earl.train()
         optimizer.zero_grad()
         batch_zero_one_loss = 0.0
         batch_value_loss = 0.0
@@ -319,7 +310,6 @@ for epoch in range(n_epochs):
             batch_value_loss += float(value_loss)/len(batch)
             batch_prediction_loss += float(prediction_loss)/len(batch)
 
-
         print(f'Batch: {batch_idx}', file=log)
         print(f'train zero one loss {sqrt(batch_zero_one_loss)}', file=log) 
         print(f'train value loss {sqrt(batch_value_loss)}',flush=True, file=log)
@@ -328,6 +318,7 @@ for epoch in range(n_epochs):
 
         # Checkpoint
         if batch_idx % checkpoint == 0:
+            earl.eval()
             idxs = random.sample(validation_idxs, k=validation_batch_size)
             predictions, p_zeros, zero_ones, ys = predict(earl, idxs, mask, eval=True)
             y_zero_one = ys > .00001
@@ -348,6 +339,5 @@ for epoch in range(n_epochs):
                       file=prediction_log, flush=True)
 
             if validation_loss < best_validation_loss:
-                breakpoint()
                 torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
 

@@ -116,23 +116,6 @@ def add_expression(graph, cell_idx):
         graph['protein_name'].y = torch.ones((len(node_idxs['protein_name']),1), device=device)*-1
         graph['protein_name'].y[protein_idxs[:,1],-1] = protein[0,protein_idxs[:,0]]
 
-        #n_genes = len(node_idxs['gene'])
-        #n_atac_region = len(node_idxs['atac_region'])
-        #n_protein_names = len(node_idxs['protein_name'])
-        #_genes = np.ones((n_genes,))*-1
-        #_proteins = np.ones((n_protein_names,))*-1
-
-        #for i in range(gene.shape[1]):
-        #    if gene_idxs[i]:
-        #        _genes[gene_idxs[i]] = gene[0,i]
-        #graph['gene'].x[:,-1] = tensor(_genes)
-        
-
-        #for i in range(protein.shape[1]):
-        #    if protein_idxs[i]:
-        #        _proteins[protein_idxs[i]] = protein[0,i]
-        #graph['protein_name'].y = _proteins
-
         graph['protein_name'].x = torch.ones((len(node_idxs['protein_name']),1), device=device)*-1
         graph['atac_region'].x[:,-1] = torch.ones((len(node_idxs['atac_region'])), device=device)*-1
 

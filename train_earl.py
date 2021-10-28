@@ -72,7 +72,7 @@ def add_expression(graph, cell_idx, task):
         graph[target].y = torch.ones((len(node_idxs[target]),1), device=device)*-1
         graph[target].y[tgt_idxs[:,1],-1] = tgt_expr[0,tgt_idxs[:,0]]
 
-        for node_type in ['gene','protein_name','atac_region']:
+        for node_type in ['gene','atac_region']:
             if node_type not in (source, target):
                 graph[node_type].x[:,-1] = torch.ones((len(node_idxs[node_type])), device=device)*-1
 
@@ -137,7 +137,7 @@ class EaRL(torch.nn.Module):
         x_dict['p_zero'] = self.sigmoid(self.atac_zero(x_dict['atac_region']))
         return x_dict
 
-    def protein(self, x_dict, edge_index_dict):
+    def protein_name(self, x_dict, edge_index_dict):
         x_dict = self.encode(x_dict, edge_index_dict)
         x_dict['p_zero'] = self.sigmoid(self.protein_zero(x_dict['protein_name']))
         x_dict['zeros'] = Bernoulli(x_dict['p_zero']).sample()
@@ -151,7 +151,7 @@ class EaRL(torch.nn.Module):
         if target == 'protein_name':
             x = self.protein_name(x_dict, edge_index_dict)
         if target == 'atac_region':
-            x = self.atac_region(x_dict, edge_index_dict)
+            x = self.atac(x_dict, edge_index_dict)
 
         return x
 
@@ -227,10 +227,10 @@ datafile = 'openproblems_bmmc_multiome_phase1_mod2.censor_dataset.output_train_m
 gene_data = scanpy.read_h5ad(datadir+datafile)
 gene_idxs, gene_expression = genes_to_idxs(gene_data)
 
-expression[('atac','gene')] = (protein_expression,gene_expression)
-graph_idxs[('atac','gene')] = (protein_idxs,gene_idxs)
-expression[('gene','atac')] = (gene_expression,protein_expression)
-graph_idxs[('gene','atac')] = (gene_idxs,protein_idxs)
+expression[('atac_region','gene')] = (atac_expression,gene_expression)
+graph_idxs[('atac_region','gene')] = (atac_idxs,gene_idxs)
+expression[('gene','atac_region')] = (gene_expression,atac_expression)
+graph_idxs[('gene','atac_region')] = (gene_idxs,atac_idxs)
 
 print('Making graph undirected')
 graph = graph.to('cpu')
@@ -279,15 +279,13 @@ def predict(earl, graph, task, idxs, mask, eval=False):
     with torch.inference_mode(eval):
         num_predictions = len(idxs)
         predictions = []
-        ys = []
 
         for i,idx in enumerate(idxs):
             newgraph = add_expression(graph, idx, task)
-            ys.append(graph[target].y)
             output = earl(newgraph.x_dict, newgraph.edge_index_dict, task)
-            predictions.append(output)
+            predictions.append((output, graph[target].y))
 
-        return predictions, ys
+        return predictions
 
 def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
@@ -296,6 +294,23 @@ def chunks(lst, n):
 
 task_batches = {task:enumerate(iter(chunks(idxs, train_batch_size)))
                 for task,idxs in train_cell_idxs.items()}
+
+def compute_loss(prediction, y, target, mask):
+    y_zero = y > .00001
+    # TODO normalize loss so that genes/atacs dont swamp protein gradients?
+    p_zeros = prediction['p_zero'][mask]
+    
+    if target == 'atac_region':
+        loss = bce_loss(p_zeros, y_zero.float())
+        return loss, 0, 0, loss
+    if target in ['gene', 'protein_name']:
+        values = prediction['values'][mask]
+        zeros = prediction['zeros'][mask]
+        zero_loss = bce_loss(p_zeros, y_zero.float())
+        value_loss = ((values[y_zero] - y[y_zero])**2).mean()
+        prediction_loss = float(((values*zeros - y)**2).mean())
+        loss = zero_loss + value_loss
+        return loss, prediction_loss, value_loss, zero_loss
 
 print('Starting training')
 for epoch in range(n_epochs):
@@ -321,27 +336,14 @@ for epoch in range(n_epochs):
             batch_prediction_loss = 0.0
             for idx in batch:
                 # only one prediction at a time, minimizes memory usage
-                predictions, ys = predict(earl, graph, task, [idx], mask)
-                prediction = predictions[0]
-                y = ys[0]
-
-                y_zero = y > .00001
-                # TODO normalize loss so that genes/atacs dont swamp protein gradients?
-                if target == 'atac_region':
-                    loss = bce_loss(prediction['p_zero'], y_zero.float())
-                    batch_zero_loss += float(loss)/len(batch)
-                if target in ['gene', 'protein_name']:
-                    values = prediction['values']
-                    zeros = prediction['zeros']
-                    p_zeros = prediction['p_zero']
-                    zero_loss = bce_loss(zeros, y_zero.float())
-                    value_loss = ((values[y_zero] - y[y_zero])**2).mean()
-                    prediction_loss = float(((values*zeros - y)**2).mean())
-                    loss = zero_loss + value_loss
-                    batch_zero_loss += float(zero_loss)/len(batch)
-                    batch_value_loss += float(value_loss)/len(batch)
-                    batch_prediction_loss += float(prediction_loss)/len(batch)
+                prediction, y = predict(earl, graph, task, [idx], mask)[0]
+                losses = compute_loss(prediction, y[mask], target, mask) 
+                loss, prediction_loss, value_loss, zero_loss = losses
                 loss.backward()
+
+                batch_zero_loss += float(zero_loss)/len(batch)
+                batch_value_loss += float(value_loss)/len(batch)
+                batch_prediction_loss += float(prediction_loss)/len(batch)
 
 
             print(f'Batch: {batch_idx}', file=log)
@@ -351,27 +353,23 @@ for epoch in range(n_epochs):
             optimizer.step()
 
             # Checkpoint
-            if batch_idx % checkpoint == 0:
+            if (batch_idx+1) % checkpoint == 0:
                 earl.eval()
                 idxs = random.sample(validation_cell_idxs[task], k=validation_batch_size)
                 output = predict(earl, graph, task, idxs, mask, eval=True)
                 # TODO something wrong here
+                validation_loss = 0.0
+                zero_loss = 0.0
+                value_loss = 0.0
                 for prediction,y in output:
-                    y_zero = y > .00001
-                    # TODO normalize loss so that genes/atacs dont swamp protein gradients?
-                    if target == 'atac_region':
-                        loss = bce_loss(prediction['p_zero'], y_zero.float())
-                        zero_loss += float(loss)/len(batch)
-                    if target in ['gene', 'protein_name']:
-                        values = prediction['values']
-                        zeros = prediction['zeros']
-                        p_zeros = prediction['p_zero']
-                        zero_loss += float(bce_loss(zeros, y_zero.float()))/len(batch)
-                        value_loss += float(((values[y_zero] - y[y_zero])**2).mean())/len(batch)
-                        prediction_loss += float(((values*zeros - y)**2).mean())/len(batch)
+                    losses = compute_loss(prediction, y[mask], target, mask) 
+                    _, _validation_loss, _value_loss, _zero_loss = losses
+                    zero_loss += _zero_loss
+                    value_loss += _value_loss
+                    validation_loss += _validation_loss
                 print(f'validation zero one loss {task} {float(zero_loss)}', file=log) 
                 print(f'validation value loss {task} {float(value_loss)}',flush=True, file=log)
-                print(f'validation prediction loss {task} {prediction_loss}',flush=True, file=log)
+                print(f'validation prediction loss {task} {validation_loss}',flush=True, file=log)
 
                 stacked = torch.vstack([prediction['values']*zeros, y])
 
@@ -384,4 +382,5 @@ for epoch in range(n_epochs):
 
                 if validation_loss < best_validation_loss and log:
                     torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
+                    best_validation_loss = validation_loss
 

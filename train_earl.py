@@ -39,7 +39,7 @@ def genes_to_idxs(data):
     return tensor(indexes,device=device), data.X
 
 def atacs_to_idxs(data):
-    indexes = {}
+    indexes = []
     regions = data.var.index.to_list()
     for i,region in enumerate(regions):
         if region in node_idxs['atac_region']:
@@ -64,8 +64,8 @@ def add_expression(graph, cell_idx, task):
         # the rest of the features combined
         src_expr = tensor(expression[task][0][cell_idx].todense(),device=device)*128
         tgt_expr = tensor(expression[task][1][cell_idx].todense(),device=device)
-        src_idxs = idxs[task][0]
-        tgt_idxs = idxs[task][1]
+        src_idxs = graph_idxs[task][0]
+        tgt_idxs = graph_idxs[task][1]
 
         graph[source].x[src_idxs[:,1],-1] = src_expr[0,src_idxs[:,0]]
 
@@ -90,8 +90,6 @@ class EaRL(torch.nn.Module):
         layer_classes = {'GATConv':GATConv, 'SAGEConv':SAGEConv,
                          'TransformerConv':TransformerConv}
 
-        self.methods = {'protein_name':self.protein, 'gene':self.gene, 'atac_region':self.atac}
-
         for layer_type, params in gnn_layers:
             layer_type = layer_classes[layer_type]
             conv = HeteroConv({
@@ -113,21 +111,13 @@ class EaRL(torch.nn.Module):
 
             self.convs.append(conv)
 
-        last_layer, last_params = gnn_layers[-1]
-        last_layer = layer_classes[last_layer]
-        hidden = last_params['out_channels']
-
-        self.protein_layer = HeteroConv({('protein', 'is_named', 'protein_name'): 
-                                        last_layer(in_channels=(-1, -1), **last_params)})
-
         self.protein_zero  = MLP(**out_mlp) 
         self.protein_value = MLP(**out_mlp)
 
-        # TODO maybe make this a small NN?
-        #self.gene_layer = Linear(hidden,1)
-        #self.gene_zero  = Linear(hidden,1)
+        self.gene_value = MLP(**out_mlp) 
+        self.gene_zero  = MLP(**out_mlp) 
 
-        #self.atac_layer = Linear(hidden,1)
+        self.atac_zero = MLP(**out_mlp) 
 
     def encode(self, x_dict, edge_index_dict):
         for conv in self.convs:
@@ -135,28 +125,23 @@ class EaRL(torch.nn.Module):
             x_dict = {key: x.relu() for key, x in x_dict.items()}
         return x_dict
 
-    #def gene(self, x_dict, edge_index_dict):
-    #    x_dict = self.encode(x_dict, edge_index_dict)
-    #    x_dict['p_gene_zero'] = self.sigmoid(self.gene_zero(x_dict['gene']))
-    #    x_dict['gene_zero'] = Bernoulli(x_dict['p_gene_zero']).sample()
-    #    x_dict['gene_value'] = self.gene(x_dict['gene'])
-    #    return x_dict
+    def gene(self, x_dict, edge_index_dict):
+        x_dict = self.encode(x_dict, edge_index_dict)
+        x_dict['p_zero'] = self.sigmoid(self.gene_zero(x_dict['gene']))
+        x_dict['zeros'] = Bernoulli(x_dict['p_zero']).sample()
+        x_dict['values'] = self.gene_value(x_dict['gene'])
+        return x_dict
 
-    #def atac(self, x_dict, edge_index_dict):
-    #    x_dict = self.encode(x_dict, edge_index_dict)
-    #    x_dict['atac_value'] = self.sigmoid(self.atac(x_dict['atac_region']))
-    #    return x_dict
+    def atac(self, x_dict, edge_index_dict):
+        x_dict = self.encode(x_dict, edge_index_dict)
+        x_dict['p_zero'] = self.sigmoid(self.atac_zero(x_dict['atac_region']))
+        return x_dict
 
     def protein(self, x_dict, edge_index_dict):
         x_dict = self.encode(x_dict, edge_index_dict)
-
-        x_dict['protein_name'] = torch.ones((len(node_idxs['protein_name']),1),device=device)*-1
-
-        protein_name_embedding = self.protein_layer(x_dict, edge_index_dict)['protein_name']
-        x_dict['p_protein_zero'] = self.sigmoid(self.protein_zero(protein_name_embedding))
-        x_dict['protein_zero'] = Bernoulli(x_dict['p_protein_zero']).sample()
-        x_dict['protein_value'] = self.protein_value(protein_name_embedding)
-
+        x_dict['p_zero'] = self.sigmoid(self.protein_zero(x_dict['protein_name']))
+        x_dict['zeros'] = Bernoulli(x_dict['p_zero']).sample()
+        x_dict['values'] = self.protein_value(x_dict['protein_name'])
         return x_dict
     
     def forward(self, x_dict, edge_index_dict, task):
@@ -192,8 +177,9 @@ params = {
     'n_epochs':10,
     'layers':[('SAGEConv', {'out_channels':128}),
               ('SAGEConv', {'out_channels':128}),
-              ('TransformerConv', {'out_channels':32, 'heads':2})],
-    'out_mlp':{'dim_in':64, 'dim_out':1, 'bias':True, 
+              ('SAGEConv', {'out_channels':128})],
+              #('TransformerConv', {'out_channels':32, 'heads':2})],
+    'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
                'dim_inner': 512, 'num_layers':3},
     'train_batch_size': 20,
     'validation_batch_size': 100,
@@ -212,6 +198,10 @@ graph.to(device)
 node_idxs = pickle.load(open('input/nodes_by_type.pickle','rb'))
 graph = expand_for_data(graph)
 
+expression = {}
+# For each task
+# match the index of the data to the index of the graph
+graph_idxs = {}
 print('Loading protein/gene data')
 datadir = 'output/datasets/predict_modality/openproblems_bmmc_cite_phase1_mod2/'
 datafile = 'openproblems_bmmc_cite_phase1_mod2.censor_dataset.output_train_mod1.h5ad'
@@ -222,10 +212,10 @@ datafile = 'openproblems_bmmc_cite_phase1_mod2.censor_dataset.output_train_mod2.
 gene_data = scanpy.read_h5ad(datadir+datafile)
 gene_idxs, gene_expression = genes_to_idxs(gene_data)
 
-expression[('protein','gene')] = (protein_expression,gene_expression)
-idxs[('protein','gene')] = (protein_idxs,gene_idxs)
-expression[('gene','protein')] = (gene_expression,protein_expression)
-idxs[('gene','protein')] = (gene_idxs,protein_idxs)
+expression[('protein_name','gene')] = (protein_expression,gene_expression)
+graph_idxs[('protein_name','gene')] = (protein_idxs,gene_idxs)
+expression[('gene','protein_name')] = (gene_expression,protein_expression)
+graph_idxs[('gene','protein_name')] = (gene_idxs,protein_idxs)
 
 print('Loading atac/gene data')
 datadir = 'output/datasets/predict_modality/openproblems_bmmc_multiome_phase1_mod2/'
@@ -238,19 +228,17 @@ gene_data = scanpy.read_h5ad(datadir+datafile)
 gene_idxs, gene_expression = genes_to_idxs(gene_data)
 
 expression[('atac','gene')] = (protein_expression,gene_expression)
-idxs[('atac','gene')] = (protein_idxs,gene_idxs)
+graph_idxs[('atac','gene')] = (protein_idxs,gene_idxs)
 expression[('gene','atac')] = (gene_expression,protein_expression)
-idxs[('gene','atac')] = (gene_idxs,protein_idxs)
+graph_idxs[('gene','atac')] = (gene_idxs,protein_idxs)
 
 print('Making graph undirected')
 graph = graph.to('cpu')
 graph = torch_geometric.transforms.ToUndirected()(graph)
 graph = graph.to(device)
 
-def set_mask(graph, task):
+def get_mask(graph, task):
     for i,node_type in enumerate(task):
-        mask = torch.zeros((len(node_idxs[node_type]),1), dtype=bool, device=device)
-        mask[idxs[task][i][:,1]] = 1
         graph[node_type]['mask'] = mask
     return graph
 
@@ -273,7 +261,7 @@ for task in expression:
     num_cells = expression[task][0].shape[0]
     train_set_size = int(num_cells*.7)
     val_set_size = num_cells - train_set_size
-    cell_idxs = list(len(expression[task]))
+    cell_idxs = list(range(num_cells))
     random.shuffle(cell_idxs)
     train_cell_idxs[task] = cell_idxs[:train_set_size]
     validation_cell_idxs[task] = cell_idxs[train_set_size:]
@@ -286,61 +274,78 @@ bce_loss = BCELoss()
 best_validation_loss = float('inf')
 
 # TODO make this take a task as an input variable
-def predict(earl, task, idxs, mask, eval=False):
+def predict(earl, graph, task, idxs, mask, eval=False):
+    source,target = task
     with torch.inference_mode(eval):
         num_predictions = len(idxs)
-        predictions = torch.zeros((num_predictions, mask.sum()), device=device)
-        p_zeros = torch.zeros((num_predictions, mask.sum()), device=device)
-        zero_ones = torch.zeros((num_predictions, mask.sum()), device=device)
-        ys = torch.zeros((num_predictions, mask.sum()), device=device)
+        predictions = []
+        ys = []
 
         for i,idx in enumerate(idxs):
             newgraph = add_expression(graph, idx, task)
-            output = earl(task, newgraph.x_dict, newgraph.edge_index_dict)
-            predictions[i] = output['protein_value'][mask].flatten()
-            p_zeros[i] = output['p_protein_zero'][mask].flatten()
-            zero_ones[i] = output['protein_zero'][mask].flatten()
-            ys[i] = newgraph['protein_name'].y[mask]
+            ys.append(graph[target].y)
+            output = earl(newgraph.x_dict, newgraph.edge_index_dict, task)
+            predictions.append(output)
 
-        return predictions, p_zeros, zero_ones, ys
+        return predictions, ys
 
 def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
-batches = {task:list(chunks(idxs, train_batch_size)) for task,idxs in train_cell_idxs.items()}
+task_batches = {task:enumerate(iter(chunks(idxs, train_batch_size)))
+                for task,idxs in train_cell_idxs.items()}
 
 print('Starting training')
 for epoch in range(n_epochs):
     print(f'Epoch: {epoch}', file=log)
-    mask = graph['protein_name']['mask']
     
     # TODO MAML here?
-    # TODO this is messed up
-    # TODO step through batches?
-    for batch_idx, batch in enumerate(batches):
-        for task,batch in batches.items():
+    tasks_not_done = True
+    while tasks_not_done:
+        tasks_not_done = False
+        for task,batches in task_batches.items():
+            source,target = task
+            mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
+            mask[graph_idxs[task][1][:,1]] = 1
+            b = next(batches, None)
+            if b is None:
+               continue
+            batch_idx,batch = b
+            tasks_not_done = True
             earl.train()
             optimizer.zero_grad()
-            batch_zero_one_loss = 0.0
+            batch_zero_loss = 0.0
             batch_value_loss = 0.0
             batch_prediction_loss = 0.0
             for idx in batch:
-                predictions, p_zeros, zero_ones, ys = predict(earl, [idx], mask)
-                y_zero_one = ys > .00001
-                zero_one_loss = bce_loss(p_zeros, y_zero_one.float())
-                value_loss = ((predictions[y_zero_one] - ys[y_zero_one])**2).mean()
-                prediction_loss = float(((predictions*zero_ones - ys)**2).mean())
-                loss = zero_one_loss + value_loss
+                # only one prediction at a time, minimizes memory usage
+                predictions, ys = predict(earl, graph, task, [idx], mask)
+                prediction = predictions[0]
+                y = ys[0]
+
+                y_zero = y > .00001
+                # TODO normalize loss so that genes/atacs dont swamp protein gradients?
+                if target == 'atac_region':
+                    loss = bce_loss(prediction['p_zero'], y_zero.float())
+                    batch_zero_loss += float(loss)/len(batch)
+                if target in ['gene', 'protein_name']:
+                    values = prediction['values']
+                    zeros = prediction['zeros']
+                    p_zeros = prediction['p_zero']
+                    zero_loss = bce_loss(zeros, y_zero.float())
+                    value_loss = ((values[y_zero] - y[y_zero])**2).mean()
+                    prediction_loss = float(((values*zeros - y)**2).mean())
+                    loss = zero_loss + value_loss
+                    batch_zero_loss += float(zero_loss)/len(batch)
+                    batch_value_loss += float(value_loss)/len(batch)
+                    batch_prediction_loss += float(prediction_loss)/len(batch)
                 loss.backward()
 
-                batch_zero_one_loss += float(zero_one_loss)/len(batch)
-                batch_value_loss += float(value_loss)/len(batch)
-                batch_prediction_loss += float(prediction_loss)/len(batch)
 
             print(f'Batch: {batch_idx}', file=log)
-            print(f'train zero one loss {task} {batch_zero_one_loss}', file=log) 
+            print(f'train zero one loss {task} {batch_zero_loss}', file=log) 
             print(f'train value loss {task} {batch_value_loss}',flush=True, file=log)
             print(f'train prediction loss {task} {batch_prediction_loss}',flush=True, file=log)
             optimizer.step()
@@ -348,17 +353,27 @@ for epoch in range(n_epochs):
             # Checkpoint
             if batch_idx % checkpoint == 0:
                 earl.eval()
-                idxs = random.sample(validation_idxs, k=validation_batch_size)
-                predictions, p_zeros, zero_ones, ys = predict(earl, idxs, mask, eval=True)
-                y_zero_one = ys > .00001
-                zero_one_loss = bce_loss(p_zeros, y_zero_one.float())
-                value_loss = ((predictions[y_zero_one] - ys[y_zero_one])**2).mean()
-                validation_loss = float(((predictions*zero_ones - ys)**2).mean())
-                print(f'validation zero one loss {task} {float(zero_one_loss)}', file=log) 
+                idxs = random.sample(validation_cell_idxs[task], k=validation_batch_size)
+                output = predict(earl, graph, task, idxs, mask, eval=True)
+                # TODO something wrong here
+                for prediction,y in output:
+                    y_zero = y > .00001
+                    # TODO normalize loss so that genes/atacs dont swamp protein gradients?
+                    if target == 'atac_region':
+                        loss = bce_loss(prediction['p_zero'], y_zero.float())
+                        zero_loss += float(loss)/len(batch)
+                    if target in ['gene', 'protein_name']:
+                        values = prediction['values']
+                        zeros = prediction['zeros']
+                        p_zeros = prediction['p_zero']
+                        zero_loss += float(bce_loss(zeros, y_zero.float()))/len(batch)
+                        value_loss += float(((values[y_zero] - y[y_zero])**2).mean())/len(batch)
+                        prediction_loss += float(((values*zeros - y)**2).mean())/len(batch)
+                print(f'validation zero one loss {task} {float(zero_loss)}', file=log) 
                 print(f'validation value loss {task} {float(value_loss)}',flush=True, file=log)
-                print(f'validation prediction loss {task} {validation_loss}',flush=True, file=log)
+                print(f'validation prediction loss {task} {prediction_loss}',flush=True, file=log)
 
-                stacked = torch.vstack([predictions[0,:]*zero_ones[0,:], ys[0,:]])
+                stacked = torch.vstack([prediction['values']*zeros, y])
 
                 if prediction_log:
                     prediction_log.truncate(0)

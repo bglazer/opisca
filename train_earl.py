@@ -177,15 +177,17 @@ params = {
     'n_epochs':10,
     'layers':[('SAGEConv', {'out_channels':128}),
               ('SAGEConv', {'out_channels':128}),
+              ('SAGEConv', {'out_channels':128}),
+              ('SAGEConv', {'out_channels':128}),
               ('SAGEConv', {'out_channels':128})],
               #('TransformerConv', {'out_channels':32, 'heads':2})],
     'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
                'dim_inner': 512, 'num_layers':3},
-    'train_batch_size': 20,
+    'train_batch_size': 100,
     'validation_batch_size': 100,
     'checkpoint': 25,
-    'atac_ones_weight': 10,
-    'gene_ones_weight': 10,
+    'atac_ones_weight': 100,
+    'gene_ones_weight': 100,
     'device': device,
 }
 
@@ -359,7 +361,8 @@ for epoch in range(n_epochs):
             optimizer.step()
 
         # Checkpoint
-        if (batch_idx+1) % checkpoint == 0:
+        if (batch_idx) % checkpoint == 0:
+            print('Checkpoint', file=log)
             earl.eval()
             total_validation_loss = 0.0
             if prediction_log:
@@ -370,12 +373,11 @@ for epoch in range(n_epochs):
                 mask[graph_idxs[task][1][:,1]] = 1
 
                 idxs = random.sample(validation_cell_idxs[task], k=validation_batch_size)
-                output = predict(earl, graph, task, idxs, mask, eval=True)
-                # TODO something wrong here
                 validation_loss = 0.0
                 zero_loss = 0.0
                 value_loss = 0.0
-                for prediction,y in output:
+                for idx in idxs:
+                    prediction, y = predict(earl, graph, task, [idx], mask, eval=True)[0]
                     y = y[mask].flatten()
                     losses = compute_loss(prediction, y, target, mask) 
                     _, _validation_loss, _value_loss, _zero_loss = losses

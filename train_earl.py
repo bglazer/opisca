@@ -89,6 +89,9 @@ class EaRL(torch.nn.Module):
         # the class of the layer (i.e GATConv) in the param dictionary
         layer_classes = {'GATConv':GATConv, 'SAGEConv':SAGEConv,
                          'TransformerConv':TransformerConv}
+
+        self.methods = {'protein_name':self.protein, 'gene':self.gene, 'atac_region':self.atac}
+
         for layer_type, params in gnn_layers:
             layer_type = layer_classes[layer_type]
             conv = HeteroConv({
@@ -156,6 +159,17 @@ class EaRL(torch.nn.Module):
 
         return x_dict
     
+    def forward(self, x_dict, edge_index_dict, task):
+        source, target = task
+        if target == 'gene':
+            x = self.gene(x_dict, edge_index_dict)
+        if target == 'protein_name':
+            x = self.protein_name(x_dict, edge_index_dict)
+        if target == 'atac_region':
+            x = self.atac_region(x_dict, edge_index_dict)
+
+        return x
+
 
 print('Starting')
 now = datetime.strftime(datetime.now(), format='%Y%m%d-%H%M')
@@ -240,12 +254,6 @@ def set_mask(graph, task):
         graph[node_type]['mask'] = mask
     return graph
 
-# TODO trim the gene names, we have way more gene names than we have in the data
-num_cells = gene_expression.shape[0]
-
-train_set_size = int(num_cells*.7)
-
-val_set_size = num_cells - train_set_size
 
 print('Initializing EaRL')
 earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'])
@@ -257,11 +265,18 @@ earl.train()
 n_epochs = params['n_epochs']
 checkpoint = params['checkpoint']
 
-# TODO need to do this for each task
-cell_idxs = list(range(gene_expression.shape[0]))
-random.shuffle(cell_idxs)
-train_idxs = cell_idxs[:train_set_size]
-validation_idxs = cell_idxs[train_set_size:]
+# TODO trim the gene names, we have way more gene names than we have in the data
+
+train_cell_idxs = {}
+validation_cell_idxs = {}
+for task in expression:
+    num_cells = expression[task][0].shape[0]
+    train_set_size = int(num_cells*.7)
+    val_set_size = num_cells - train_set_size
+    cell_idxs = list(len(expression[task]))
+    random.shuffle(cell_idxs)
+    train_cell_idxs[task] = cell_idxs[:train_set_size]
+    validation_cell_idxs[task] = cell_idxs[train_set_size:]
 
 train_batch_size = params['train_batch_size']
 validation_batch_size = params['validation_batch_size']
@@ -271,7 +286,7 @@ bce_loss = BCELoss()
 best_validation_loss = float('inf')
 
 # TODO make this take a task as an input variable
-def predict(earl, idxs, mask, eval=False):
+def predict(earl, task, idxs, mask, eval=False):
     with torch.inference_mode(eval):
         num_predictions = len(idxs)
         predictions = torch.zeros((num_predictions, mask.sum()), device=device)
@@ -280,8 +295,8 @@ def predict(earl, idxs, mask, eval=False):
         ys = torch.zeros((num_predictions, mask.sum()), device=device)
 
         for i,idx in enumerate(idxs):
-            newgraph = add_expression(graph, idx)
-            output = earl.protein(newgraph.x_dict, newgraph.edge_index_dict)
+            newgraph = add_expression(graph, idx, task)
+            output = earl(task, newgraph.x_dict, newgraph.edge_index_dict)
             predictions[i] = output['protein_value'][mask].flatten()
             p_zeros[i] = output['p_protein_zero'][mask].flatten()
             zero_ones[i] = output['protein_zero'][mask].flatten()
@@ -294,66 +309,64 @@ def chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
+batches = {task:list(chunks(idxs, train_batch_size)) for task,idxs in train_cell_idxs.items()}
+
 print('Starting training')
-# TODO setting up batches for each task??
-# TODO randomized sequence for each task? 
-# TODO 
 for epoch in range(n_epochs):
-    batches = chunks(train_idxs, train_batch_size)
     print(f'Epoch: {epoch}', file=log)
     mask = graph['protein_name']['mask']
     
     # TODO MAML here?
-    # TODO for task in expression:
-    # TODO     graph = set_mask(graph, task)
-    # TODO     setting up expression data
+    # TODO this is messed up
+    # TODO step through batches?
     for batch_idx, batch in enumerate(batches):
-        earl.train()
-        optimizer.zero_grad()
-        batch_zero_one_loss = 0.0
-        batch_value_loss = 0.0
-        batch_prediction_loss = 0.0
-        for idx in batch:
-            predictions, p_zeros, zero_ones, ys = predict(earl, [idx], mask)
-            y_zero_one = ys > .00001
-            zero_one_loss = bce_loss(p_zeros, y_zero_one.float())
-            value_loss = ((predictions[y_zero_one] - ys[y_zero_one])**2).mean()
-            prediction_loss = float(((predictions*zero_ones - ys)**2).mean())
-            loss = zero_one_loss + value_loss
-            loss.backward()
+        for task,batch in batches.items():
+            earl.train()
+            optimizer.zero_grad()
+            batch_zero_one_loss = 0.0
+            batch_value_loss = 0.0
+            batch_prediction_loss = 0.0
+            for idx in batch:
+                predictions, p_zeros, zero_ones, ys = predict(earl, [idx], mask)
+                y_zero_one = ys > .00001
+                zero_one_loss = bce_loss(p_zeros, y_zero_one.float())
+                value_loss = ((predictions[y_zero_one] - ys[y_zero_one])**2).mean()
+                prediction_loss = float(((predictions*zero_ones - ys)**2).mean())
+                loss = zero_one_loss + value_loss
+                loss.backward()
 
-            batch_zero_one_loss += float(zero_one_loss)/len(batch)
-            batch_value_loss += float(value_loss)/len(batch)
-            batch_prediction_loss += float(prediction_loss)/len(batch)
+                batch_zero_one_loss += float(zero_one_loss)/len(batch)
+                batch_value_loss += float(value_loss)/len(batch)
+                batch_prediction_loss += float(prediction_loss)/len(batch)
 
-        print(f'Batch: {batch_idx}', file=log)
-        print(f'train zero one loss {batch_zero_one_loss}', file=log) 
-        print(f'train value loss {batch_value_loss}',flush=True, file=log)
-        print(f'train prediction loss {batch_prediction_loss}',flush=True, file=log)
-        optimizer.step()
+            print(f'Batch: {batch_idx}', file=log)
+            print(f'train zero one loss {task} {batch_zero_one_loss}', file=log) 
+            print(f'train value loss {task} {batch_value_loss}',flush=True, file=log)
+            print(f'train prediction loss {task} {batch_prediction_loss}',flush=True, file=log)
+            optimizer.step()
 
-        # Checkpoint
-        if batch_idx % checkpoint == 0:
-            earl.eval()
-            idxs = random.sample(validation_idxs, k=validation_batch_size)
-            predictions, p_zeros, zero_ones, ys = predict(earl, idxs, mask, eval=True)
-            y_zero_one = ys > .00001
-            zero_one_loss = bce_loss(p_zeros, y_zero_one.float())
-            value_loss = ((predictions[y_zero_one] - ys[y_zero_one])**2).mean()
-            validation_loss = float(((predictions*zero_ones - ys)**2).mean())
-            print(f'validation zero one loss {float(zero_one_loss)}', file=log) 
-            print(f'validation value loss {float(value_loss)}',flush=True, file=log)
-            print(f'validation prediction loss {validation_loss}',flush=True, file=log)
+            # Checkpoint
+            if batch_idx % checkpoint == 0:
+                earl.eval()
+                idxs = random.sample(validation_idxs, k=validation_batch_size)
+                predictions, p_zeros, zero_ones, ys = predict(earl, idxs, mask, eval=True)
+                y_zero_one = ys > .00001
+                zero_one_loss = bce_loss(p_zeros, y_zero_one.float())
+                value_loss = ((predictions[y_zero_one] - ys[y_zero_one])**2).mean()
+                validation_loss = float(((predictions*zero_ones - ys)**2).mean())
+                print(f'validation zero one loss {task} {float(zero_one_loss)}', file=log) 
+                print(f'validation value loss {task} {float(value_loss)}',flush=True, file=log)
+                print(f'validation prediction loss {task} {validation_loss}',flush=True, file=log)
 
-            stacked = torch.vstack([predictions[0,:]*zero_ones[0,:], ys[0,:]])
+                stacked = torch.vstack([predictions[0,:]*zero_ones[0,:], ys[0,:]])
 
-            if prediction_log:
-                prediction_log.truncate(0)
-            for i in range(stacked.shape[1]):
-                print(f'batch {batch_idx} {i:<6d} pred,y: '+
-                      f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
-                      file=prediction_log, flush=True)
+                if prediction_log:
+                    prediction_log.truncate(0)
+                for i in range(stacked.shape[1]):
+                    print(f'batch {batch_idx} {i:<6d} pred,y: '+
+                          f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
+                          file=prediction_log, flush=True)
 
-            if validation_loss < best_validation_loss and log:
-                torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
+                if validation_loss < best_validation_loss and log:
+                    torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
 

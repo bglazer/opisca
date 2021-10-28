@@ -57,6 +57,7 @@ def expand_for_data(graph):
         
 
 def add_expression(graph, cell_idx, task):
+    source, target = task
     with torch.no_grad():
         graph['protein_name'].x = torch.ones((len(node_idxs['protein_name']),1), device=device)*-1
         # 128 is the feature size from the node2vec
@@ -156,9 +157,7 @@ class EaRL(torch.nn.Module):
         return x
 
 
-print('Starting')
 now = datetime.strftime(datetime.now(), format='%Y%m%d-%H%M')
-print(now)
 
 # Device is first command line arg
 device=sys.argv[1]
@@ -170,7 +169,8 @@ else:
     log = open(f'logs/train_earl_{now}.log','w')
     prediction_log = open(f'logs/train_earl_prediction_sample_{now}.log','w')
 
-
+print('Starting', file=log)
+print(now, file=log)
 
 params = {
     'lr':.001,
@@ -183,7 +183,7 @@ params = {
                'dim_inner': 512, 'num_layers':3},
     'train_batch_size': 20,
     'validation_batch_size': 100,
-    'checkpoint': 50,
+    'checkpoint': 25,
     'device': device,
 }
 
@@ -191,7 +191,7 @@ if log:
     with open(f'logs/earl_params_{now}.json','w') as param_file:
         json.dump(params, param_file)
 
-print('Loading graph')
+print('Loading graph', file=log)
 graph = torch.load('input/graph_with_embeddings.torch')
 graph.to(device)
 
@@ -202,7 +202,7 @@ expression = {}
 # For each task
 # match the index of the data to the index of the graph
 graph_idxs = {}
-print('Loading protein/gene data')
+print('Loading protein/gene data', file=log)
 datadir = 'output/datasets/predict_modality/openproblems_bmmc_cite_phase1_mod2/'
 datafile = 'openproblems_bmmc_cite_phase1_mod2.censor_dataset.output_train_mod1.h5ad'
 protein_data = scanpy.read_h5ad(datadir+datafile)
@@ -217,7 +217,7 @@ graph_idxs[('protein_name','gene')] = (protein_idxs,gene_idxs)
 expression[('gene','protein_name')] = (gene_expression,protein_expression)
 graph_idxs[('gene','protein_name')] = (gene_idxs,protein_idxs)
 
-print('Loading atac/gene data')
+print('Loading atac/gene data', file=log)
 datadir = 'output/datasets/predict_modality/openproblems_bmmc_multiome_phase1_mod2/'
 datafile = 'openproblems_bmmc_multiome_phase1_mod2.censor_dataset.output_train_mod1.h5ad'
 atac_data = scanpy.read_h5ad(datadir+datafile)
@@ -232,7 +232,7 @@ graph_idxs[('atac_region','gene')] = (atac_idxs,gene_idxs)
 expression[('gene','atac_region')] = (gene_expression,atac_expression)
 graph_idxs[('gene','atac_region')] = (gene_idxs,atac_idxs)
 
-print('Making graph undirected')
+print('Making graph undirected', file=log)
 graph = graph.to('cpu')
 graph = torch_geometric.transforms.ToUndirected()(graph)
 graph = graph.to(device)
@@ -243,7 +243,7 @@ def get_mask(graph, task):
     return graph
 
 
-print('Initializing EaRL')
+print('Initializing EaRL', file=log)
 earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'])
 earl = earl.to(device)
 
@@ -302,7 +302,8 @@ def compute_loss(prediction, y, target, mask):
     
     if target == 'atac_region':
         loss = bce_loss(p_zeros, y_zero.float())
-        return loss, 0, 0, loss
+        return loss, loss, 0, loss
+
     if target in ['gene', 'protein_name']:
         values = prediction['values'][mask]
         zeros = prediction['zeros'][mask]
@@ -312,9 +313,9 @@ def compute_loss(prediction, y, target, mask):
         loss = zero_loss + value_loss
         return loss, prediction_loss, value_loss, zero_loss
 
-print('Starting training')
+print('Starting training', file=log)
 for epoch in range(n_epochs):
-    print(f'Epoch: {epoch}', file=log)
+    print(f'Epoch={epoch}', file=log)
     
     # TODO MAML here?
     tasks_not_done = True
@@ -329,7 +330,6 @@ for epoch in range(n_epochs):
                continue
             batch_idx,batch = b
             tasks_not_done = True
-            earl.train()
             optimizer.zero_grad()
             batch_zero_loss = 0.0
             batch_value_loss = 0.0
@@ -345,16 +345,23 @@ for epoch in range(n_epochs):
                 batch_value_loss += float(value_loss)/len(batch)
                 batch_prediction_loss += float(prediction_loss)/len(batch)
 
-
-            print(f'Batch: {batch_idx}', file=log)
-            print(f'train zero one loss {task} {batch_zero_loss}', file=log) 
-            print(f'train value loss {task} {batch_value_loss}',flush=True, file=log)
-            print(f'train prediction loss {task} {batch_prediction_loss}',flush=True, file=log)
+            print(f'Batch={batch_idx}', file=log)
+            print(f'train zero one loss {task}={batch_zero_loss}', file=log) 
+            print(f'train value loss {task}={batch_value_loss}',flush=True, file=log)
+            print(f'train prediction loss {task}={batch_prediction_loss}',flush=True, file=log)
             optimizer.step()
 
-            # Checkpoint
-            if (batch_idx+1) % checkpoint == 0:
-                earl.eval()
+        # Checkpoint
+        if (batch_idx) % checkpoint == 0:
+            earl.eval()
+            total_validation_loss = 0.0
+            if prediction_log:
+                prediction_log.truncate(0)
+            for task,_ in task_batches.items():
+                source,target = task
+                mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
+                mask[graph_idxs[task][1][:,1]] = 1
+
                 idxs = random.sample(validation_cell_idxs[task], k=validation_batch_size)
                 output = predict(earl, graph, task, idxs, mask, eval=True)
                 # TODO something wrong here
@@ -362,25 +369,35 @@ for epoch in range(n_epochs):
                 zero_loss = 0.0
                 value_loss = 0.0
                 for prediction,y in output:
-                    losses = compute_loss(prediction, y[mask], target, mask) 
+                    y = y[mask].flatten()
+                    losses = compute_loss(prediction, y, target, mask) 
                     _, _validation_loss, _value_loss, _zero_loss = losses
                     zero_loss += _zero_loss
                     value_loss += _value_loss
                     validation_loss += _validation_loss
-                print(f'validation zero one loss {task} {float(zero_loss)}', file=log) 
-                print(f'validation value loss {task} {float(value_loss)}',flush=True, file=log)
-                print(f'validation prediction loss {task} {validation_loss}',flush=True, file=log)
+                print(f'validation zero one loss {task}={float(zero_loss)}', file=log) 
+                print(f'validation value loss {task}={float(value_loss)}',flush=True, file=log)
+                print(f'validation prediction loss {task}={validation_loss}',flush=True, file=log)
+                total_validation_loss += validation_loss
 
-                stacked = torch.vstack([prediction['values']*zeros, y])
+                if target == 'atac_region':
+                    p_zeros = prediction['p_zero'][mask]
+                    stacked = torch.vstack([p_zeros, y])
 
-                if prediction_log:
-                    prediction_log.truncate(0)
-                for i in range(stacked.shape[1]):
+                if target in ['gene', 'protein_name']:
+                    zeros = prediction['zeros'][mask]
+                    values = prediction['values'][mask]
+                    stacked = torch.vstack([values*zeros, y])
+
+                print('-'*80, file=prediction_log)
+                print(f'Task: {task}', file=prediction_log)
+                print('-'*80, file=prediction_log)
+                for i in range(min(stacked.shape[1], 300)):
                     print(f'batch {batch_idx} {i:<6d} pred,y: '+
                           f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
                           file=prediction_log, flush=True)
 
-                if validation_loss < best_validation_loss and log:
-                    torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
-                    best_validation_loss = validation_loss
+            if total_validation_loss < best_validation_loss and log:
+                torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
+                best_validation_loss = total_validation_loss
 

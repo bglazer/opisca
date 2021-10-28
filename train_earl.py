@@ -184,6 +184,8 @@ params = {
     'train_batch_size': 20,
     'validation_batch_size': 100,
     'checkpoint': 25,
+    'atac_ones_weight': 10,
+    'gene_ones_weight': 10,
     'device': device,
 }
 
@@ -301,10 +303,15 @@ def compute_loss(prediction, y, target, mask):
     p_zeros = prediction['p_zero'][mask]
     
     if target == 'atac_region':
+        bce_loss = BCELoss(weight=1+y_zero*params['atac_ones_weight'])
         loss = bce_loss(p_zeros, y_zero.float())
         return loss, loss, 0, loss
 
     if target in ['gene', 'protein_name']:
+        if target=='gene':
+            bce_loss = BCELoss(weight=1+y_zero*params['gene_ones_weight'])
+        else:
+            bce_loss = BCELoss()
         values = prediction['values'][mask]
         zeros = prediction['zeros'][mask]
         zero_loss = bce_loss(p_zeros, y_zero.float())
@@ -352,7 +359,7 @@ for epoch in range(n_epochs):
             optimizer.step()
 
         # Checkpoint
-        if (batch_idx) % checkpoint == 0:
+        if (batch_idx+1) % checkpoint == 0:
             earl.eval()
             total_validation_loss = 0.0
             if prediction_log:

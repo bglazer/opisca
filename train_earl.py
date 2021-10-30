@@ -296,8 +296,6 @@ def chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
-task_batches = {task:enumerate(iter(chunks(idxs, train_batch_size)))
-                for task,idxs in train_cell_idxs.items()}
 
 def compute_loss(prediction, y, target, mask):
     y_zero = y > .00001
@@ -325,6 +323,8 @@ def compute_loss(prediction, y, target, mask):
 print('Starting training', file=log)
 for epoch in range(n_epochs):
     print(f'Epoch={epoch}', file=log)
+    task_batches = {task:enumerate(iter(chunks(idxs, train_batch_size)))
+                    for task,idxs in train_cell_idxs.items()}
     
     # TODO MAML here?
     tasks_not_done = True

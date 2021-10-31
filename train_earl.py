@@ -190,11 +190,11 @@ params = {
               #('TransformerConv', {'out_channels':32, 'heads':2})],
     'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
                'dim_inner': 512, 'num_layers':3},
-    'train_batch_size': 100,
+    'train_batch_size': 10,
     'validation_batch_size': 100,
     'checkpoint': 25,
-    'atac_ones_weight': 100,
-    'gene_ones_weight': 100,
+    'atac_ones_weight': 10,
+    'gene_ones_weight': 10,
     'device': device,
 }
 
@@ -360,49 +360,52 @@ for batch_idx in range(n_steps):
     optimizer.step()
 
     # Checkpoint
+    # TODO evaluate on all tasks
     if (batch_idx) % checkpoint == 0:
         print('Checkpoint', file=log)
         earl.eval()
-        total_validation_loss = 0.0
-        if prediction_log:
-            prediction_log.truncate(0)
+        for task in tasks:
+            source,target = task
+            total_validation_loss = 0.0
+            if prediction_log:
+                prediction_log.truncate(0)
 
-        mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
-        mask[graph_idxs[task][1][:,1]] = 1
+            mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
+            mask[graph_idxs[task][1][:,1]] = 1
 
-        idxs = random.sample(validation_cell_idxs[task], k=validation_batch_size)
-        validation_loss = 0.0
-        zero_loss = 0.0
-        value_loss = 0.0
-        for idx in idxs:
-            prediction, y = predict(earl, graph, task, [idx], mask, eval=True)[0]
-            y = y[mask].flatten()
-            losses = compute_loss(prediction, y, target, mask) 
-            _, _validation_loss, _value_loss, _zero_loss = losses
-            zero_loss += _zero_loss
-            value_loss += _value_loss
-            validation_loss += _validation_loss
-        print(f'validation zero one loss {task}={float(zero_loss)}', file=log) 
-        print(f'validation value loss {task}={float(value_loss)}',flush=True, file=log)
-        print(f'validation prediction loss {task}={validation_loss}',flush=True, file=log)
-        total_validation_loss += validation_loss
+            idxs = random.sample(validation_cell_idxs[task], k=validation_batch_size)
+            validation_loss = 0.0
+            zero_loss = 0.0
+            value_loss = 0.0
+            for idx in idxs:
+                prediction, y = predict(earl, graph, task, [idx], mask, eval=True)[0]
+                y = y[mask].flatten()
+                losses = compute_loss(prediction, y, target, mask) 
+                _, _validation_loss, _value_loss, _zero_loss = losses
+                zero_loss += _zero_loss
+                value_loss += _value_loss
+                validation_loss += _validation_loss
+            print(f'validation zero one loss {task}={float(zero_loss)}', file=log) 
+            print(f'validation value loss {task}={float(value_loss)}',flush=True, file=log)
+            print(f'validation prediction loss {task}={validation_loss}',flush=True, file=log)
+            total_validation_loss += validation_loss
 
-        if target == 'atac_region':
-            p_zeros = prediction['p_zero'][mask]
-            stacked = torch.vstack([p_zeros, y])
+            if target == 'atac_region':
+                p_zeros = prediction['p_zero'][mask]
+                stacked = torch.vstack([p_zeros, y])
 
-        if target in ['gene', 'protein_name']:
-            zeros = prediction['zeros'][mask]
-            values = prediction['values'][mask]
-            stacked = torch.vstack([values*zeros, y])
+            if target in ['gene', 'protein_name']:
+                zeros = prediction['zeros'][mask]
+                values = prediction['values'][mask]
+                stacked = torch.vstack([values*zeros, y])
 
-        print('-'*80, file=prediction_log)
-        print(f'Task: {task}', file=prediction_log)
-        print('-'*80, file=prediction_log)
-        for i in range(min(stacked.shape[1], 300)):
-            print(f'batch {batch_idx} {i:<6d} pred,y: '+
-                  f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
-                  file=prediction_log, flush=True)
+            print('-'*80, file=prediction_log)
+            print(f'Task: {task}', file=prediction_log)
+            print('-'*80, file=prediction_log)
+            for i in range(min(stacked.shape[1], 300)):
+                print(f'batch {batch_idx} {i:<6d} pred,y: '+
+                      f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
+                      file=prediction_log, flush=True)
 
         if total_validation_loss < best_validation_loss and log:
             torch.save(earl.state_dict(), f'models/best_earl_{now}.model')

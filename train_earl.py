@@ -108,6 +108,13 @@ class EaRL(torch.nn.Module):
                 ('gene', 'associated', 'protein'): layer_type(**params, in_channels=(-1,-1)),
                 ('protein', 'is_named', 'protein_name'): layer_type(**params, in_channels=(-1,-1)),
                 ('protein_name', 'rev_is_named', 'protein'): layer_type(**params, in_channels=(-1,-1)),
+                ('enhancer','overlaps','atac_region'): layer_type(**params, in_channels=(-1,-1)),
+                ('atac_region','rev_overlaps','enhancer'): layer_type(**params, in_channels=(-1,-1)),
+                ('enhancer','associated','gene'): layer_type(**params, in_channels=(-1,-1)),
+                ('gene','rev_associated','enhancer'): layer_type(**params, in_channels=(-1,-1)),
+                ('atac_region','neighbors','gene'): layer_type(**params, in_channels=(-1,-1)),
+                ('gene','rev_neighbors','atac_region'): layer_type(**params, in_channels=(-1,-1)),
+
             })
 
             self.convs.append(conv)
@@ -174,7 +181,7 @@ print(now, file=log)
 
 params = {
     'lr':.001,
-    'n_epochs':10,
+    'n_steps':5000,
     'layers':[('SAGEConv', {'out_channels':128}),
               ('SAGEConv', {'out_channels':128}),
               ('SAGEConv', {'out_channels':128}),
@@ -196,10 +203,8 @@ if log:
         json.dump(params, param_file)
 
 print('Loading graph', file=log)
-graph = torch.load('input/graph_with_embeddings.torch')
-graph.to(device)
-
 node_idxs = pickle.load(open('input/nodes_by_type.pickle','rb'))
+graph = torch.load('input/graph_with_embeddings.torch').to(device)
 graph = expand_for_data(graph)
 
 expression = {}
@@ -254,7 +259,7 @@ earl = earl.to(device)
 optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['lr'])
 earl.train()
 
-n_epochs = params['n_epochs']
+n_steps = params['n_steps']
 checkpoint = params['checkpoint']
 
 # TODO trim the gene names, we have way more gene names than we have in the data
@@ -320,93 +325,86 @@ def compute_loss(prediction, y, target, mask):
         loss = zero_loss + value_loss
         return loss, prediction_loss, value_loss, zero_loss
 
+tasks = list(train_cell_idxs.keys())
+
 print('Starting training', file=log)
-for epoch in range(n_epochs):
-    print(f'Epoch={epoch}', file=log)
-    task_batches = {task:enumerate(iter(chunks(idxs, train_batch_size)))
-                    for task,idxs in train_cell_idxs.items()}
+for batch_idx in range(n_steps):
+    # ParallelDataLoader here?
+    # some data loader from learn2learn?
+    task = random.choice(tasks)
+    batch = random.sample(train_cell_idxs[task], k=train_batch_size)
     
-    # TODO MAML here?
-    tasks_not_done = True
-    while tasks_not_done:
-        tasks_not_done = False
-        for task,batches in task_batches.items():
-            source,target = task
-            mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
-            mask[graph_idxs[task][1][:,1]] = 1
-            b = next(batches, None)
-            if b is None:
-               continue
-            batch_idx,batch = b
-            tasks_not_done = True
-            optimizer.zero_grad()
-            batch_zero_loss = 0.0
-            batch_value_loss = 0.0
-            batch_prediction_loss = 0.0
-            for idx in batch:
-                # only one prediction at a time, minimizes memory usage
-                prediction, y = predict(earl, graph, task, [idx], mask)[0]
-                losses = compute_loss(prediction, y[mask], target, mask) 
-                loss, prediction_loss, value_loss, zero_loss = losses
-                loss.backward()
+    # TODO REPTILE here
+    source,target = task
+    mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
+    mask[graph_idxs[task][1][:,1]] = 1
+    optimizer.zero_grad()
+    batch_zero_loss = 0.0
+    batch_value_loss = 0.0
+    batch_prediction_loss = 0.0
+    for idx in batch:
+        # only one prediction at a time, minimizes memory usage
+        prediction, y = predict(earl, graph, task, [idx], mask)[0]
+        losses = compute_loss(prediction, y[mask], target, mask) 
+        loss, prediction_loss, value_loss, zero_loss = losses
+        loss.backward()
 
-                batch_zero_loss += float(zero_loss)/len(batch)
-                batch_value_loss += float(value_loss)/len(batch)
-                batch_prediction_loss += float(prediction_loss)/len(batch)
+        batch_zero_loss += float(zero_loss)/len(batch)
+        batch_value_loss += float(value_loss)/len(batch)
+        batch_prediction_loss += float(prediction_loss)/len(batch)
 
-            print(f'Batch={batch_idx}', file=log)
-            print(f'train zero one loss {task}={batch_zero_loss}', file=log) 
-            print(f'train value loss {task}={batch_value_loss}',flush=True, file=log)
-            print(f'train prediction loss {task}={batch_prediction_loss}',flush=True, file=log)
-            optimizer.step()
+    print(f'Batch={batch_idx}', file=log)
+    print(f'train zero one loss {task}={batch_zero_loss}', file=log) 
+    print(f'train value loss {task}={batch_value_loss}',flush=True, file=log)
+    print(f'train prediction loss {task}={batch_prediction_loss}',flush=True, file=log)
+    optimizer.step()
 
-        # Checkpoint
-        if (batch_idx) % checkpoint == 0:
-            print('Checkpoint', file=log)
-            earl.eval()
-            total_validation_loss = 0.0
-            if prediction_log:
-                prediction_log.truncate(0)
-            for task,_ in task_batches.items():
-                source,target = task
-                mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
-                mask[graph_idxs[task][1][:,1]] = 1
+    # Checkpoint
+    if (batch_idx) % checkpoint == 0:
+        print('Checkpoint', file=log)
+        earl.eval()
+        total_validation_loss = 0.0
+        if prediction_log:
+            prediction_log.truncate(0)
 
-                idxs = random.sample(validation_cell_idxs[task], k=validation_batch_size)
-                validation_loss = 0.0
-                zero_loss = 0.0
-                value_loss = 0.0
-                for idx in idxs:
-                    prediction, y = predict(earl, graph, task, [idx], mask, eval=True)[0]
-                    y = y[mask].flatten()
-                    losses = compute_loss(prediction, y, target, mask) 
-                    _, _validation_loss, _value_loss, _zero_loss = losses
-                    zero_loss += _zero_loss
-                    value_loss += _value_loss
-                    validation_loss += _validation_loss
-                print(f'validation zero one loss {task}={float(zero_loss)}', file=log) 
-                print(f'validation value loss {task}={float(value_loss)}',flush=True, file=log)
-                print(f'validation prediction loss {task}={validation_loss}',flush=True, file=log)
-                total_validation_loss += validation_loss
+        mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
+        mask[graph_idxs[task][1][:,1]] = 1
 
-                if target == 'atac_region':
-                    p_zeros = prediction['p_zero'][mask]
-                    stacked = torch.vstack([p_zeros, y])
+        idxs = random.sample(validation_cell_idxs[task], k=validation_batch_size)
+        validation_loss = 0.0
+        zero_loss = 0.0
+        value_loss = 0.0
+        for idx in idxs:
+            prediction, y = predict(earl, graph, task, [idx], mask, eval=True)[0]
+            y = y[mask].flatten()
+            losses = compute_loss(prediction, y, target, mask) 
+            _, _validation_loss, _value_loss, _zero_loss = losses
+            zero_loss += _zero_loss
+            value_loss += _value_loss
+            validation_loss += _validation_loss
+        print(f'validation zero one loss {task}={float(zero_loss)}', file=log) 
+        print(f'validation value loss {task}={float(value_loss)}',flush=True, file=log)
+        print(f'validation prediction loss {task}={validation_loss}',flush=True, file=log)
+        total_validation_loss += validation_loss
 
-                if target in ['gene', 'protein_name']:
-                    zeros = prediction['zeros'][mask]
-                    values = prediction['values'][mask]
-                    stacked = torch.vstack([values*zeros, y])
+        if target == 'atac_region':
+            p_zeros = prediction['p_zero'][mask]
+            stacked = torch.vstack([p_zeros, y])
 
-                print('-'*80, file=prediction_log)
-                print(f'Task: {task}', file=prediction_log)
-                print('-'*80, file=prediction_log)
-                for i in range(min(stacked.shape[1], 300)):
-                    print(f'batch {batch_idx} {i:<6d} pred,y: '+
-                          f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
-                          file=prediction_log, flush=True)
+        if target in ['gene', 'protein_name']:
+            zeros = prediction['zeros'][mask]
+            values = prediction['values'][mask]
+            stacked = torch.vstack([values*zeros, y])
 
-            if total_validation_loss < best_validation_loss and log:
-                torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
-                best_validation_loss = total_validation_loss
+        print('-'*80, file=prediction_log)
+        print(f'Task: {task}', file=prediction_log)
+        print('-'*80, file=prediction_log)
+        for i in range(min(stacked.shape[1], 300)):
+            print(f'batch {batch_idx} {i:<6d} pred,y: '+
+                  f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
+                  file=prediction_log, flush=True)
+
+        if total_validation_loss < best_validation_loss and log:
+            torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
+            best_validation_loss = total_validation_loss
 

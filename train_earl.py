@@ -19,6 +19,7 @@ import torch_geometric
 from torch import tensor
 from torch.distributions import Bernoulli
 from torch_geometric.graphgym.models import MLP
+from copy import deepcopy
 
 
 def proteins_to_idxs(data):
@@ -180,6 +181,7 @@ print('Starting', file=log)
 print(now, file=log)
 
 params = {
+    'mode':'reptile'
     'inner_lr': .001,
     'outer_lr': .01,
     'inner_steps': 5,
@@ -258,8 +260,8 @@ print('Initializing EaRL', file=log)
 earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'])
 earl = earl.to(device)
 
-inner_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
-outer_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['outer_lr'])
+optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
+
 earl.train()
 
 n_steps = params['n_steps']
@@ -288,7 +290,8 @@ best_validation_loss = float('inf')
 # TODO make this take a task as an input variable
 def predict(earl, graph, task, idxs, mask, eval=False):
     source,target = task
-    with torch.inference_mode(eval):
+    context = torch.no_grad() if eval else torch.enable_grad()
+    with context:
         num_predictions = len(idxs)
         predictions = []
 
@@ -298,6 +301,7 @@ def predict(earl, graph, task, idxs, mask, eval=False):
             predictions.append((output, graph[target].y))
 
         return predictions
+        
 
 def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
@@ -328,27 +332,12 @@ def compute_loss(prediction, y, target, mask):
         loss = zero_loss + value_loss
         return loss, prediction_loss, value_loss, zero_loss
 
-tasks = list(train_cell_idxs.keys())
-
-print('Starting training', file=log)
-for batch_idx in range(n_steps):
-    # ParallelDataLoader here?
-    # some data loader from learn2learn?
-    task = random.choice(tasks)
-    batch = random.sample(train_cell_idxs[task], k=train_batch_size)
-    
-    # INNER LOOP
-    #for iteration 1,2,3,…do
-    #  Randomly sample a task T
+def inner_loop(earl, task, batch, batch_type, verbose=True):
     #  Perform k>1 steps of SGD on task T, starting with parameters Φ, resulting in parameters W
-    #  Update: Φ←Φ+ϵ(W−Φ)\Phi
-    #end for
-    #Return Φ
-    # TODO REPTILE here
     source,target = task
     mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
     mask[graph_idxs[task][1][:,1]] = 1
-    optimizer.zero_grad()
+    #optimizer.zero_grad()
     batch_zero_loss = 0.0
     batch_value_loss = 0.0
     batch_prediction_loss = 0.0
@@ -358,48 +347,93 @@ for batch_idx in range(n_steps):
         losses = compute_loss(prediction, y[mask], target, mask) 
         loss, prediction_loss, value_loss, zero_loss = losses
         loss.backward()
+        # TODO just use ADAM here
+        #for param in earl.parameters():
+        #    param.data -= params['inner_lr'] * param.grad.dataa
 
         batch_zero_loss += float(zero_loss)/len(batch)
         batch_value_loss += float(value_loss)/len(batch)
         batch_prediction_loss += float(prediction_loss)/len(batch)
 
     optimizer.step()
-    print(f'Batch={batch_idx}', file=log)
-    print(f'train zero one loss {task}={batch_zero_loss}', file=log) 
-    print(f'train value loss {task}={batch_value_loss}',flush=True, file=log)
-    print(f'train prediction loss {task}={batch_prediction_loss}',flush=True, file=log)
+    if verbose:
+        print(f'Batch={batch_idx}', file=log)
+        print(f'{batch_type} zero one loss {task}={batch_zero_loss}', file=log) 
+        print(f'{batch_type} value loss {task}={batch_value_loss}',flush=True, file=log)
+        print(f'{batch_type} prediction loss {task}={batch_prediction_loss}',flush=True, file=log)
 
+    #return earl.state_dict()
+
+
+
+tasks = list(train_cell_idxs.keys())
+
+print('Starting training', file=log)
+outerstepsize = params['outer_lr']
+
+# dummy batch to initialize parameters
+task = tasks[0]
+source,target = task
+idx = random.sample(train_cell_idxs[task], k=1)
+mask = torch.ones((len(node_idxs[target]),1), dtype=bool, device=device)
+predict(earl, graph, task, idx, mask, eval=True)
+
+#for iteration 1,2,3,…do
+for batch_idx in range(n_steps):
+    # ParallelDataLoader here?
+    # some data loader from learn2learn?
+    #  Randomly sample a task T
+    task = random.choice(tasks)
+
+    weights_before = deepcopy(earl.state_dict())
+    # Inner updates
+    for inner_step in range(params['inner_steps']):
+        print(f'Inner step={inner_step}', file=log, flush=True)
+        batch = random.sample(train_cell_idxs[task], k=train_batch_size)
+        inner_loop(earl, task, batch, 'train')
+
+    weights_after = earl.state_dict()
+    # TODO evaluation batch after inner loops?
+
+    # Outer update
+    # Update: Φ←Φ+ϵ(W−Φ)
+    new_state = {}
+    for name in weights_before:
+        before = weights_before[name]
+        after = weights_after[name]
+        diff = after-before
+        # TODO try: explicitly set grad attribute of parameters, pass to ADAM
+        updated = before + diff * outerstepsize
+        new_state[name] = updated
+    earl.load_state_dict(new_state)
+    
     # Checkpoint
     # TODO evaluate on all tasks
     if (batch_idx) % checkpoint == 0:
+        # Save state before validation training
+        weights_before = deepcopy(earl.state_dict())
         print('Checkpoint', file=log)
-        earl.eval()
+        #earl.eval()
         for task in tasks:
             source,target = task
             total_validation_loss = 0.0
             if prediction_log:
                 prediction_log.truncate(0)
 
+            # Inner updates
+            for inner_step in range(params['inner_steps']):
+                batch = random.sample(validation_cell_idxs[task], k=validation_batch_size)
+                weights_after = inner_loop(earl, task, batch, 'validation')
+            #TODO eval after inner loops?
+
+            idx = random.sample(validation_cell_idxs[task], k=1)
             mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
             mask[graph_idxs[task][1][:,1]] = 1
+            earl.eval()
+            prediction, y = predict(earl, graph, task, idx, mask, eval=True)[0]
+            y=y[mask]
 
-            idxs = random.sample(validation_cell_idxs[task], k=validation_batch_size)
-            validation_loss = 0.0
-            zero_loss = 0.0
-            value_loss = 0.0
-            for idx in idxs:
-                prediction, y = predict(earl, graph, task, [idx], mask, eval=True)[0]
-                y = y[mask].flatten()
-                losses = compute_loss(prediction, y, target, mask) 
-                _, _validation_loss, _value_loss, _zero_loss = losses
-                zero_loss += _zero_loss/len(idxs)
-                value_loss += _value_loss/len(idxs)
-                validation_loss += _validation_loss/len(idxs)
-            print(f'validation zero one loss {task}={float(zero_loss)}', file=log) 
-            print(f'validation value loss {task}={float(value_loss)}',flush=True, file=log)
-            print(f'validation prediction loss {task}={validation_loss}',flush=True, file=log)
-            total_validation_loss += validation_loss
-
+            # Print a sample of predictions
             if target == 'atac_region':
                 p_zeros = prediction['p_zero'][mask]
                 stacked = torch.vstack([p_zeros, y])
@@ -416,6 +450,9 @@ for batch_idx in range(n_steps):
                 print(f'batch {batch_idx} {i:<6d} pred,y: '+
                       f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
                       file=prediction_log, flush=True)
+
+            # Reset weights to initial state before tuning (inner loops) on this task
+            earl.load_state_dict(weights_before)
 
         if total_validation_loss < best_validation_loss and log:
             torch.save(earl.state_dict(), f'models/best_earl_{now}.model')

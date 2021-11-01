@@ -181,7 +181,7 @@ print('Starting', file=log)
 print(now, file=log)
 
 params = {
-    'mode':'reptile'
+    'mode':'reptile',
     'inner_lr': .001,
     'outer_lr': .01,
     'inner_steps': 5,
@@ -194,7 +194,7 @@ params = {
               #('TransformerConv', {'out_channels':32, 'heads':2})],
     'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
                'dim_inner': 512, 'num_layers':3},
-    'train_batch_size': 100,
+    'train_batch_size': 10,
     'validation_batch_size': 100,
     'checkpoint': 25,
     'atac_ones_weight': 10,
@@ -260,7 +260,6 @@ print('Initializing EaRL', file=log)
 earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'])
 earl = earl.to(device)
 
-optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
 
 earl.train()
 
@@ -337,7 +336,7 @@ def inner_loop(earl, task, batch, batch_type, verbose=True):
     source,target = task
     mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
     mask[graph_idxs[task][1][:,1]] = 1
-    #optimizer.zero_grad()
+    inner_optimizer.zero_grad()
     batch_zero_loss = 0.0
     batch_value_loss = 0.0
     batch_prediction_loss = 0.0
@@ -355,9 +354,9 @@ def inner_loop(earl, task, batch, batch_type, verbose=True):
         batch_value_loss += float(value_loss)/len(batch)
         batch_prediction_loss += float(prediction_loss)/len(batch)
 
-    optimizer.step()
+    inner_optimizer.step()
     if verbose:
-        print(f'Batch={batch_idx}', file=log)
+        print(f'Batch={step_idx}', file=log)
         print(f'{batch_type} zero one loss {task}={batch_zero_loss}', file=log) 
         print(f'{batch_type} value loss {task}={batch_value_loss}',flush=True, file=log)
         print(f'{batch_type} prediction loss {task}={batch_prediction_loss}',flush=True, file=log)
@@ -367,9 +366,10 @@ def inner_loop(earl, task, batch, batch_type, verbose=True):
 
 
 tasks = list(train_cell_idxs.keys())
+outer_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['outer_lr'])
 
 print('Starting training', file=log)
-outerstepsize = params['outer_lr']
+outer_lr = params['outer_lr']
 
 # dummy batch to initialize parameters
 task = tasks[0]
@@ -379,13 +379,14 @@ mask = torch.ones((len(node_idxs[target]),1), dtype=bool, device=device)
 predict(earl, graph, task, idx, mask, eval=True)
 
 #for iteration 1,2,3,…do
-for batch_idx in range(n_steps):
+for step_idx in range(n_steps):
     # ParallelDataLoader here?
     # some data loader from learn2learn?
     #  Randomly sample a task T
     task = random.choice(tasks)
 
     weights_before = deepcopy(earl.state_dict())
+    inner_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
     # Inner updates
     for inner_step in range(params['inner_steps']):
         print(f'Inner step={inner_step}', file=log, flush=True)
@@ -403,13 +404,13 @@ for batch_idx in range(n_steps):
         after = weights_after[name]
         diff = after-before
         # TODO try: explicitly set grad attribute of parameters, pass to ADAM
-        updated = before + diff * outerstepsize
+        updated = before + diff * outer_lr
         new_state[name] = updated
     earl.load_state_dict(new_state)
     
     # Checkpoint
     # TODO evaluate on all tasks
-    if (batch_idx) % checkpoint == 0:
+    if (step_idx+1) % checkpoint == 0:
         # Save state before validation training
         weights_before = deepcopy(earl.state_dict())
         print('Checkpoint', file=log)
@@ -421,9 +422,12 @@ for batch_idx in range(n_steps):
                 prediction_log.truncate(0)
 
             # Inner updates
-            for inner_step in range(params['inner_steps']):
+            inner_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
+            for inner_step in range(params['inner_steps']-1):
                 batch = random.sample(validation_cell_idxs[task], k=validation_batch_size)
-                weights_after = inner_loop(earl, task, batch, 'validation')
+                weights_after = inner_loop(earl, task, batch, 'validation', verbose=False)
+            batch = random.sample(validation_cell_idxs[task], k=validation_batch_size)
+            weights_after = inner_loop(earl, task, batch, 'validation', verbose=True)
             #TODO eval after inner loops?
 
             idx = random.sample(validation_cell_idxs[task], k=1)
@@ -447,7 +451,7 @@ for batch_idx in range(n_steps):
             print(f'Task: {task}', file=prediction_log)
             print('-'*80, file=prediction_log)
             for i in range(min(stacked.shape[1], 300)):
-                print(f'batch {batch_idx} {i:<6d} pred,y: '+
+                print(f'batch {step_idx} {i:<6d} pred,y: '+
                       f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
                       file=prediction_log, flush=True)
 

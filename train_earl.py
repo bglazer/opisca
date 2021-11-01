@@ -180,9 +180,7 @@ print('Starting', file=log)
 print(now, file=log)
 
 params = {
-    'inner_lr': .001,
-    'outer_lr': .01,
-    'inner_steps': 5,
+    'lr':.001,
     'n_steps':5000,
     'layers':[('SAGEConv', {'out_channels':128}),
               ('SAGEConv', {'out_channels':128}),
@@ -192,7 +190,7 @@ params = {
               #('TransformerConv', {'out_channels':32, 'heads':2})],
     'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
                'dim_inner': 512, 'num_layers':3},
-    'train_batch_size': 100,
+    'train_batch_size': 10,
     'validation_batch_size': 100,
     'checkpoint': 25,
     'atac_ones_weight': 10,
@@ -258,8 +256,7 @@ print('Initializing EaRL', file=log)
 earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'])
 earl = earl.to(device)
 
-inner_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
-outer_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['outer_lr'])
+optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['lr'])
 earl.train()
 
 n_steps = params['n_steps']
@@ -337,13 +334,6 @@ for batch_idx in range(n_steps):
     task = random.choice(tasks)
     batch = random.sample(train_cell_idxs[task], k=train_batch_size)
     
-    # INNER LOOP
-    #for iteration 1,2,3,…do
-    #  Randomly sample a task T
-    #  Perform k>1 steps of SGD on task T, starting with parameters Φ, resulting in parameters W
-    #  Update: Φ←Φ+ϵ(W−Φ)\Phi
-    #end for
-    #Return Φ
     # TODO REPTILE here
     source,target = task
     mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
@@ -363,11 +353,11 @@ for batch_idx in range(n_steps):
         batch_value_loss += float(value_loss)/len(batch)
         batch_prediction_loss += float(prediction_loss)/len(batch)
 
-    optimizer.step()
     print(f'Batch={batch_idx}', file=log)
     print(f'train zero one loss {task}={batch_zero_loss}', file=log) 
     print(f'train value loss {task}={batch_value_loss}',flush=True, file=log)
     print(f'train prediction loss {task}={batch_prediction_loss}',flush=True, file=log)
+    optimizer.step()
 
     # Checkpoint
     # TODO evaluate on all tasks
@@ -392,9 +382,9 @@ for batch_idx in range(n_steps):
                 y = y[mask].flatten()
                 losses = compute_loss(prediction, y, target, mask) 
                 _, _validation_loss, _value_loss, _zero_loss = losses
-                zero_loss += _zero_loss/len(idxs)
-                value_loss += _value_loss/len(idxs)
-                validation_loss += _validation_loss/len(idxs)
+                zero_loss += _zero_loss
+                value_loss += _value_loss
+                validation_loss += _validation_loss
             print(f'validation zero one loss {task}={float(zero_loss)}', file=log) 
             print(f'validation value loss {task}={float(value_loss)}',flush=True, file=log)
             print(f'validation prediction loss {task}={validation_loss}',flush=True, file=log)

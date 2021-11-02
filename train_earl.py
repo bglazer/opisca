@@ -183,10 +183,10 @@ print(now, file=log)
 
 params = {
     'mode':'reptile',
-    'inner_lr': .001,
-    'outer_lr': .01,
-    'inner_steps': 15,
-    'n_steps':5000,
+    'inner_lr': .01,
+    'outer_lr': .1,
+    'inner_steps': 5,
+    'n_steps': 10000,
     'layers':[('SAGEConv', {'out_channels':128}),
               ('SAGEConv', {'out_channels':128}),
               ('SAGEConv', {'out_channels':128}),
@@ -195,11 +195,12 @@ params = {
               #('TransformerConv', {'out_channels':32, 'heads':2})],
     'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
                'dim_inner': 512, 'num_layers':3},
-    'train_batch_size': 10,
-    'validation_batch_size': 100,
-    'checkpoint': 25,
-    'atac_ones_weight': 10,
-    'gene_ones_weight': 10,
+    'train_batch_size': 50,
+    'validation_batch_size': 50,
+    'checkpoint': 40,
+    'atac_ones_weight': 1,
+    'gene_ones_weight': 1,
+    'target_heads': True,
     'device': device,
 }
 
@@ -384,6 +385,8 @@ for step_idx in range(n_steps):
     task = next(task_iter, None)
     if task is None:
         task_iter = iter(random.sample(tasks, k=len(tasks)))
+        task = next(task_iter, None)
+    source, target = task
 
     weights_before = deepcopy(earl.state_dict())
     inner_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
@@ -401,18 +404,23 @@ for step_idx in range(n_steps):
 
     # Outer update
     # Update: Φ←Φ+ϵ(W−Φ)
+    # TODO explicitly set grad to diff, pass to ADAM
     new_state = {}
     for name in weights_before:
         before = weights_before[name]
         after = weights_after[name]
         diff = after-before
-        # TODO try: explicitly set grad attribute of parameters, pass to ADAM
-        updated = before + diff * outer_lr
-        new_state[name] = updated
+        # Don't apply outer loop to task specific heads
+        if params['target_heads'] and f'{target}_value' in name or f'{target}_zero' in name:
+            new_state[name] = after
+            # TODO for ADAM just set requires_grad = False
+        else:
+            updated = before + diff * outer_lr
+            new_state[name] = updated
     earl.load_state_dict(new_state)
+    # TODO learning rate decay
     
     # Checkpoint
-    # TODO evaluate on all tasks
     if (step_idx+1) % checkpoint == 0:
         # Save state before validation training
         weights_before = deepcopy(earl.state_dict())
@@ -442,6 +450,7 @@ for step_idx in range(n_steps):
 
             # Print a sample of predictions
             if target == 'atac_region':
+                zeros = prediction['zeros'][mask]
                 p_zeros = prediction['p_zero'][mask]
                 stacked = torch.vstack([p_zeros, y])
 

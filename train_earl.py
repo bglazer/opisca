@@ -144,6 +144,7 @@ class EaRL(torch.nn.Module):
     def atac(self, x_dict, edge_index_dict):
         x_dict = self.encode(x_dict, edge_index_dict)
         x_dict['p_zero'] = self.sigmoid(self.atac_zero(x_dict['atac_region']))
+        x_dict['zeros'] = Bernoulli(x_dict['p_zero']).sample()
         return x_dict
 
     def protein_name(self, x_dict, edge_index_dict):
@@ -184,7 +185,7 @@ params = {
     'mode':'reptile',
     'inner_lr': .001,
     'outer_lr': .01,
-    'inner_steps': 5,
+    'inner_steps': 15,
     'n_steps':5000,
     'layers':[('SAGEConv', {'out_channels':128}),
               ('SAGEConv', {'out_channels':128}),
@@ -282,8 +283,6 @@ for task in expression:
 train_batch_size = params['train_batch_size']
 validation_batch_size = params['validation_batch_size']
 
-bce_loss = BCELoss()
-
 best_validation_loss = float('inf')
 
 # TODO make this take a task as an input variable
@@ -316,7 +315,9 @@ def compute_loss(prediction, y, target, mask):
     if target == 'atac_region':
         bce_loss = BCELoss(weight=1+y_zero*params['atac_ones_weight'])
         loss = bce_loss(p_zeros, y_zero.float())
-        return loss, loss, 0, loss
+        zeros = prediction['zeros'][mask]
+        prediction_loss = float(((zeros - y)**2).mean())
+        return loss, prediction_loss, 0, loss
 
     if target in ['gene', 'protein_name']:
         if target=='gene':
@@ -346,9 +347,6 @@ def inner_loop(earl, task, batch, batch_type, verbose=True):
         losses = compute_loss(prediction, y[mask], target, mask) 
         loss, prediction_loss, value_loss, zero_loss = losses
         loss.backward()
-        # TODO just use ADAM here
-        #for param in earl.parameters():
-        #    param.data -= params['inner_lr'] * param.grad.dataa
 
         batch_zero_loss += float(zero_loss)/len(batch)
         batch_value_loss += float(value_loss)/len(batch)
@@ -388,10 +386,12 @@ for step_idx in range(n_steps):
     weights_before = deepcopy(earl.state_dict())
     inner_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
     # Inner updates
-    for inner_step in range(params['inner_steps']):
+    for inner_step in range(params['inner_steps']-1):
         print(f'Inner step={inner_step}', file=log, flush=True)
         batch = random.sample(train_cell_idxs[task], k=train_batch_size)
-        inner_loop(earl, task, batch, 'train')
+        inner_loop(earl, task, batch, 'train', verbose=False)
+    batch = random.sample(train_cell_idxs[task], k=train_batch_size)
+    inner_loop(earl, task, batch, 'train', verbose=True)
 
     weights_after = earl.state_dict()
     # TODO evaluation batch after inner loops?
@@ -415,11 +415,11 @@ for step_idx in range(n_steps):
         weights_before = deepcopy(earl.state_dict())
         print('Checkpoint', file=log)
         #earl.eval()
+        if prediction_log:
+            prediction_log.truncate(0)
         for task in tasks:
             source,target = task
             total_validation_loss = 0.0
-            if prediction_log:
-                prediction_log.truncate(0)
 
             # Inner updates
             inner_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
@@ -458,6 +458,7 @@ for step_idx in range(n_steps):
             # Reset weights to initial state before tuning (inner loops) on this task
             earl.load_state_dict(weights_before)
 
+        print(f'Total validation loss={total_validation_loss}')
         if total_validation_loss < best_validation_loss and log:
             torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
             best_validation_loss = total_validation_loss

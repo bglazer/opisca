@@ -354,7 +354,6 @@ def inner_loop(earl, task, batch, batch_type, verbose=True):
 
     inner_optimizer.step()
     if verbose:
-        print(f'Batch={step_idx}', file=log)
         print(f'{batch_type} zero one loss {task}={batch_zero_loss}', file=log) 
         print(f'{batch_type} value loss {task}={batch_value_loss}',flush=True, file=log)
         print(f'{batch_type} prediction loss {task}={batch_prediction_loss}',flush=True, file=log)
@@ -364,6 +363,7 @@ def inner_loop(earl, task, batch, batch_type, verbose=True):
 
 
 tasks = list(train_cell_idxs.keys())
+task_iter = iter(tasks)
 outer_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['outer_lr'])
 
 print('Starting training', file=log)
@@ -381,11 +381,14 @@ for step_idx in range(n_steps):
     # ParallelDataLoader here?
     # some data loader from learn2learn?
     #  Randomly sample a task T
-    task = random.choice(tasks)
+    task = next(task_iter, None)
+    if task is None:
+        task_iter = iter(random.sample(tasks, k=len(tasks)))
 
     weights_before = deepcopy(earl.state_dict())
     inner_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
     # Inner updates
+    print(f'Outer step={step_idx}', file=log)
     for inner_step in range(params['inner_steps']-1):
         print(f'Inner step={inner_step}', file=log, flush=True)
         batch = random.sample(train_cell_idxs[task], k=train_batch_size)

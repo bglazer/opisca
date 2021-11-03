@@ -286,7 +286,6 @@ best_validation_loss = float('inf')
 def predict(earl, graph, task, idxs, mask, eval=False):
     source,target = task
     with torch.inference_mode(eval):
-        num_predictions = len(idxs)
         predictions = []
 
         for i,idx in enumerate(idxs):
@@ -407,6 +406,7 @@ for batch_idx in range(n_steps):
                       f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
                       file=prediction_log, flush=True)
 
+        torch.save(earl.state_dict(), f'models/latest_earl_{now}.model')
         if total_validation_loss < best_validation_loss and log:
             torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
             best_validation_loss = total_validation_loss

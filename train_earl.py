@@ -193,8 +193,8 @@ params = {
     'train_batch_size': 10,
     'validation_batch_size': 100,
     'checkpoint': 25,
-    'atac_ones_weight': 10,
-    'gene_ones_weight': 10,
+    'atac_ones_weight': 1,
+    'gene_ones_weight': 1,
     'device': device,
 }
 
@@ -327,13 +327,11 @@ def compute_loss(prediction, y, target, mask):
 tasks = list(train_cell_idxs.keys())
 
 print('Starting training', file=log)
+# TODO mix tasks during one batch in training
 for batch_idx in range(n_steps):
-    # ParallelDataLoader here?
-    # some data loader from learn2learn?
     task = random.choice(tasks)
     batch = random.sample(train_cell_idxs[task], k=train_batch_size)
     
-    # TODO REPTILE here
     source,target = task
     mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
     mask[graph_idxs[task][1][:,1]] = 1
@@ -359,15 +357,15 @@ for batch_idx in range(n_steps):
     optimizer.step()
 
     # Checkpoint
-    # TODO evaluate on all tasks
     if (batch_idx) % checkpoint == 0:
         print('Checkpoint', file=log)
         earl.eval()
+        if prediction_log:
+            prediction_log.truncate(0)
+
         for task in tasks:
             source,target = task
             total_validation_loss = 0.0
-            if prediction_log:
-                prediction_log.truncate(0)
 
             mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
             mask[graph_idxs[task][1][:,1]] = 1
@@ -381,9 +379,9 @@ for batch_idx in range(n_steps):
                 y = y[mask].flatten()
                 losses = compute_loss(prediction, y, target, mask) 
                 _, _validation_loss, _value_loss, _zero_loss = losses
-                zero_loss += _zero_loss
-                value_loss += _value_loss
-                validation_loss += _validation_loss
+                zero_loss += _zero_loss/len(idxs)
+                value_loss += _value_loss/len(idxs)
+                validation_loss += _validation_loss/len(idxs)
             print(f'validation zero one loss {task}={float(zero_loss)}', file=log) 
             print(f'validation value loss {task}={float(value_loss)}',flush=True, file=log)
             print(f'validation prediction loss {task}={validation_loss}',flush=True, file=log)

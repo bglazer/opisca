@@ -4,22 +4,26 @@ import sys
 import json
 from datetime import datetime
 from math import sqrt
-import torch
-import numpy as np
-import scanpy
 from collections import defaultdict
 import pickle
 import random
 from collections import Counter
+from copy import deepcopy
+
+import numpy as np
+import scanpy
+
+import torch
+from torch import tensor
 import torch.nn.functional as F
 from torch.nn import Linear, LeakyReLU, Sigmoid, BCELoss
+from torch.distributions import Bernoulli
+
+import torch_geometric
 from torch_geometric.nn import GATConv, HeteroConv, SAGEConv, GATv2Conv, TransformerConv
 from torch_geometric.data import HeteroData
-import torch_geometric
-from torch import tensor
-from torch.distributions import Bernoulli
 from torch_geometric.graphgym.models import MLP
-from copy import deepcopy
+from torch_geometric.loader import NeighborLoader, HGTLoader
 
 
 def proteins_to_idxs(data):
@@ -71,14 +75,14 @@ def add_expression(graph, cell_idx, task):
 
         graph[source].x[src_idxs[:,1],-1] = src_expr[0,src_idxs[:,0]]
 
-        graph[target].y = torch.ones((len(node_idxs[target]),1), device=device)*-1
-        graph[target].y[tgt_idxs[:,1],-1] = tgt_expr[0,tgt_idxs[:,0]]
+        y = torch.ones((len(node_idxs[target]),1), device=device)*-1
+        y[tgt_idxs[:,1],-1] = tgt_expr[0,tgt_idxs[:,0]]
 
         for node_type in ['gene','atac_region']:
             if node_type not in (source, target):
                 graph[node_type].x[:,-1] = torch.ones((len(node_idxs[node_type])), device=device)*-1
 
-        return graph
+        return graph, y
     
 
 class EaRL(torch.nn.Module):
@@ -183,24 +187,25 @@ print(now, file=log)
 
 params = {
     'mode':'reptile',
+    'sampling':True,
     'inner_lr': .01,
     'outer_lr': .1,
     'inner_steps': 5,
     'n_steps': 10000,
-    'layers':[('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128})],
-              #('TransformerConv', {'out_channels':32, 'heads':2})],
-    'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
+    'layers':[('GATConv', {'out_channels':32, 'heads':2, 'concat':False}),
+              ('GATConv', {'out_channels':32, 'heads':2, 'concat':False}),
+              ('GATConv', {'out_channels':32, 'heads':2, 'concat':False}),
+              ('GATConv', {'out_channels':32, 'heads':2, 'concat':False})],
+              #('SAGEConv', {'out_channels':64}),
+              #('SAGEConv', {'out_channels':128})],
+    'out_mlp':{'dim_in':32, 'dim_out':1, 'bias':True, 
                'dim_inner': 512, 'num_layers':3},
-    'train_batch_size': 50,
-    'validation_batch_size': 50,
+    'train_batch_cells': 10,
+    'validation_batch_cells': 10,
     'checkpoint': 40,
     'atac_ones_weight': 1,
     'gene_ones_weight': 1,
-    'target_heads': True,
+    'target_heads': False,
     'device': device,
 }
 
@@ -281,25 +286,17 @@ for task in expression:
     train_cell_idxs[task] = cell_idxs[:train_set_size]
     validation_cell_idxs[task] = cell_idxs[train_set_size:]
 
-train_batch_size = params['train_batch_size']
-validation_batch_size = params['validation_batch_size']
+train_batch_cells = params['train_batch_cells']
+validation_batch_cells = params['validation_batch_cells']
 
 best_validation_loss = float('inf')
 
-# TODO make this take a task as an input variable
-def predict(earl, graph, task, idxs, mask, eval=False):
-    source,target = task
+def predict(earl, graph, task, eval=False):
     context = torch.no_grad() if eval else torch.enable_grad()
     with context:
-        num_predictions = len(idxs)
-        predictions = []
+        output = earl(graph.x_dict, graph.edge_index_dict, task)
 
-        for i,idx in enumerate(idxs):
-            newgraph = add_expression(graph, idx, task)
-            output = earl(newgraph.x_dict, newgraph.edge_index_dict, task)
-            predictions.append((output, graph[target].y))
-
-        return predictions
+        return output
         
 
 def chunks(lst, n):
@@ -333,33 +330,49 @@ def compute_loss(prediction, y, target, mask):
         loss = zero_loss + value_loss
         return loss, prediction_loss, value_loss, zero_loss
 
+
+
 def inner_loop(earl, task, batch, batch_type, verbose=True):
-    #  Perform k>1 steps of SGD on task T, starting with parameters Φ, resulting in parameters W
     source,target = task
+
     mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
-    mask[graph_idxs[task][1][:,1]] = 1
+    #mask[graph_idxs[task][1][:,1]] = 1
+    mask[2] = 1 
+
+    inner_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
     inner_optimizer.zero_grad()
+
     batch_zero_loss = 0.0
     batch_value_loss = 0.0
     batch_prediction_loss = 0.0
-    for idx in batch:
-        # only one prediction at a time, minimizes memory usage
-        prediction, y = predict(earl, graph, task, [idx], mask)[0]
-        losses = compute_loss(prediction, y[mask], target, mask) 
-        loss, prediction_loss, value_loss, zero_loss = losses
-        loss.backward()
 
-        batch_zero_loss += float(zero_loss)/len(batch)
-        batch_value_loss += float(value_loss)/len(batch)
-        batch_prediction_loss += float(prediction_loss)/len(batch)
+    for cell_idx in batch:
+        newgraph, y = add_expression(graph, cell_idx, task)
+        breakpoint()
+        # TODO need to find masked items that aren't connected to anything
+        train_loader = NeighborLoader(newgraph,
+                                      #num_samples=[10]*2,
+                                      num_neighbors=[1],
+                                      batch_size=1,
+                                      input_nodes=(target, mask.flatten())
+                                     )
+
+        for minibatch in train_loader:
+            # only one prediction at a time, minimizes memory usage
+            prediction = predict(earl, newgraph, task)
+            losses = compute_loss(prediction, y[mask], target, mask) 
+            loss, prediction_loss, value_loss, zero_loss = losses
+            loss.backward()
+
+            batch_zero_loss += float(zero_loss)/len(batch)
+            batch_value_loss += float(value_loss)/len(batch)
+            batch_prediction_loss += float(prediction_loss)/len(batch)
 
     inner_optimizer.step()
     if verbose:
         print(f'{batch_type} zero one loss {task}={batch_zero_loss}', file=log) 
         print(f'{batch_type} value loss {task}={batch_value_loss}',flush=True, file=log)
         print(f'{batch_type} prediction loss {task}={batch_prediction_loss}',flush=True, file=log)
-
-    #return earl.state_dict()
 
 
 
@@ -373,9 +386,11 @@ outer_lr = params['outer_lr']
 # dummy batch to initialize parameters
 task = tasks[0]
 source,target = task
-idx = random.sample(train_cell_idxs[task], k=1)
+idx = 0
 mask = torch.ones((len(node_idxs[target]),1), dtype=bool, device=device)
-predict(earl, graph, task, idx, mask, eval=True)
+add_expression(graph, idx, task)
+predict(earl, graph, task, eval=True)
+
 
 #for iteration 1,2,3,…do
 for step_idx in range(n_steps):
@@ -389,14 +404,13 @@ for step_idx in range(n_steps):
     source, target = task
 
     weights_before = deepcopy(earl.state_dict())
-    inner_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
     # Inner updates
     print(f'Outer step={step_idx}', file=log)
     for inner_step in range(params['inner_steps']-1):
         print(f'Inner step={inner_step}', file=log, flush=True)
-        batch = random.sample(train_cell_idxs[task], k=train_batch_size)
+        batch = random.sample(train_cell_idxs[task], k=train_batch_cells)
         inner_loop(earl, task, batch, 'train', verbose=False)
-    batch = random.sample(train_cell_idxs[task], k=train_batch_size)
+    batch = random.sample(train_cell_idxs[task], k=train_batch_cells)
     inner_loop(earl, task, batch, 'train', verbose=True)
 
     weights_after = earl.state_dict()
@@ -433,39 +447,36 @@ for step_idx in range(n_steps):
             total_validation_loss = 0.0
 
             # Inner updates
-            inner_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
             for inner_step in range(params['inner_steps']-1):
-                batch = random.sample(validation_cell_idxs[task], k=validation_batch_size)
+                batch = random.sample(validation_cell_idxs[task], k=validation_batch_cells)
                 weights_after = inner_loop(earl, task, batch, 'validation', verbose=False)
-            batch = random.sample(validation_cell_idxs[task], k=validation_batch_size)
-            weights_after = inner_loop(earl, task, batch, 'validation', verbose=True)
-            #TODO eval after inner loops?
+            batch = random.sample(validation_cell_idxs[task], k=validation_batch_cells)
 
-            idx = random.sample(validation_cell_idxs[task], k=1)
-            mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
-            mask[graph_idxs[task][1][:,1]] = 1
-            earl.eval()
-            prediction, y = predict(earl, graph, task, idx, mask, eval=True)[0]
-            y=y[mask]
+            #idx = random.sample(validation_cell_idxs[task], k=1)
+            #mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
+            #mask[graph_idxs[task][1][:,1]] = 1
+            #earl.eval()
+            #prediction = predict(earl, graph, task, eval=True)
+            #y=y[mask]
 
-            # Print a sample of predictions
-            if target == 'atac_region':
-                zeros = prediction['zeros'][mask]
-                p_zeros = prediction['p_zero'][mask]
-                stacked = torch.vstack([p_zeros, y])
+            ## Print a sample of predictions
+            #if target == 'atac_region':
+            #    zeros = prediction['zeros'][mask]
+            #    p_zeros = prediction['p_zero'][mask]
+            #    stacked = torch.vstack([p_zeros, y])
 
-            if target in ['gene', 'protein_name']:
-                zeros = prediction['zeros'][mask]
-                values = prediction['values'][mask]
-                stacked = torch.vstack([values*zeros, y])
+            #if target in ['gene', 'protein_name']:
+            #    zeros = prediction['zeros'][mask]
+            #    values = prediction['values'][mask]
+            #    stacked = torch.vstack([values*zeros, y])
 
-            print('-'*80, file=prediction_log)
-            print(f'Task: {task}', file=prediction_log)
-            print('-'*80, file=prediction_log)
-            for i in range(min(stacked.shape[1], 300)):
-                print(f'batch {step_idx} {i:<6d} pred,y: '+
-                      f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
-                      file=prediction_log, flush=True)
+            #print('-'*80, file=prediction_log)
+            #print(f'Task: {task}', file=prediction_log)
+            #print('-'*80, file=prediction_log)
+            #for i in range(min(stacked.shape[1], 300)):
+            #    print(f'batch {step_idx} {i:<6d} pred,y: '+
+            #          f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
+            #          file=prediction_log, flush=True)
 
             # Reset weights to initial state before tuning (inner loops) on this task
             earl.load_state_dict(weights_before)

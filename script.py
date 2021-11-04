@@ -11,10 +11,6 @@
 import logging
 import anndata as ad
 
-from scipy.sparse import csc_matrix
-
-from sklearn.decomposition import TruncatedSVD
-from sklearn.linear_model import LinearRegression
 
 logging.basicConfig(level=logging.INFO)
 

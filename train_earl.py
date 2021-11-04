@@ -11,12 +11,13 @@ from collections import defaultdict
 import pickle
 import random
 from collections import Counter
-import torch.nn.functional as F
 from torch.nn import Linear, LeakyReLU, Sigmoid, BCELoss
 from torch_geometric.nn import GATConv, HeteroConv, SAGEConv, GATv2Conv, TransformerConv
 from torch_geometric.data import HeteroData
 import torch_geometric
 from torch import tensor
+from torch.autograd import Variable
+import torch.nn.functional as F
 from torch.distributions import Bernoulli
 from torch_geometric.graphgym.models import MLP
 from copy import deepcopy
@@ -187,15 +188,14 @@ params = {
     'outer_lr': .1,
     'inner_steps': 5,
     'n_steps': 10000,
-    'layers':[('GATConv', {'out_channels':32, 'heads':2, 'concat':False}),
-              ('GATConv', {'out_channels':32, 'heads':2, 'concat':False}),
-              ('GATConv', {'out_channels':32, 'heads':2, 'concat':False}),
-              ('GATConv', {'out_channels':32, 'heads':2, 'concat':False})],
-              #('SAGEConv', {'out_channels':64}),
-              #('SAGEConv', {'out_channels':128})],
-    'out_mlp':{'dim_in':32, 'dim_out':1, 'bias':True, 
-               'dim_inner': 512, 'num_layers':3},
-    'train_batch_size': 10,
+    'layers':[('SAGEConv', {'out_channels':128}),
+              ('SAGEConv', {'out_channels':128}),
+              ('SAGEConv', {'out_channels':128}),
+              ('SAGEConv', {'out_channels':128}),
+              ('SAGEConv', {'out_channels':128})],
+    'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
+               'dim_inner': 512, 'num_layers':4},
+    'train_batch_size': 5,
     'validation_batch_size': 10,
     'checkpoint': 40,
     'atac_ones_weight': 1,
@@ -338,10 +338,15 @@ def inner_loop(earl, task, batch, batch_type, verbose=True):
     source,target = task
     mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
     mask[graph_idxs[task][1][:,1]] = 1
+
+    inner_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
     inner_optimizer.zero_grad()
+
     batch_zero_loss = 0.0
     batch_value_loss = 0.0
     batch_prediction_loss = 0.0
+
+
     for idx in batch:
         # only one prediction at a time, minimizes memory usage
         prediction, y = predict(earl, graph, task, [idx], mask)[0]
@@ -388,8 +393,7 @@ for step_idx in range(n_steps):
         task = next(task_iter, None)
     source, target = task
 
-    weights_before = deepcopy(earl.state_dict())
-    inner_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
+    old_params = deepcopy(list(earl.parameters()))
     # Inner updates
     print(f'Outer step={step_idx}', file=log)
     for inner_step in range(params['inner_steps']-1):
@@ -398,26 +402,23 @@ for step_idx in range(n_steps):
         inner_loop(earl, task, batch, 'train', verbose=False)
     batch = random.sample(train_cell_idxs[task], k=train_batch_size)
     inner_loop(earl, task, batch, 'train', verbose=True)
+    new_params = earl.parameters()
 
-    weights_after = earl.state_dict()
+    outer_optimizer.zero_grad()
     # TODO evaluation batch after inner loops?
 
     # Outer update
     # Update: Φ←Φ+ϵ(W−Φ)
-    # TODO explicitly set grad to diff, pass to ADAM
-    new_state = {}
-    for name in weights_before:
-        before = weights_before[name]
-        after = weights_after[name]
-        diff = after-before
-        # Don't apply outer loop to task specific heads
-        if params['target_heads'] and f'{target}_value' in name or f'{target}_zero' in name:
-            new_state[name] = after
-            # TODO for ADAM just set requires_grad = False
-        else:
-            updated = before + diff * outer_lr
-            new_state[name] = updated
-    earl.load_state_dict(new_state)
+    for before, after in zip(old_params, new_params):
+        diff = before-after
+        #print(diff.sum())
+        after.data.copy_(before)
+        if after.grad is None:
+            after.grad = Variable(torch.zeros(after.size(), dtype=after.dtype, device=device))
+        
+        after.grad.data.add_(diff)
+
+    outer_optimizer.step()
     # TODO learning rate decay
     
     # Checkpoint
@@ -433,7 +434,6 @@ for step_idx in range(n_steps):
             total_validation_loss = 0.0
 
             # Inner updates
-            inner_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
             for inner_step in range(params['inner_steps']-1):
                 batch = random.sample(validation_cell_idxs[task], k=validation_batch_size)
                 weights_after = inner_loop(earl, task, batch, 'validation', verbose=False)
@@ -470,6 +470,7 @@ for step_idx in range(n_steps):
             # Reset weights to initial state before tuning (inner loops) on this task
             earl.load_state_dict(weights_before)
 
+        torch.save(earl.state_dict(), f'models/latest_earl_{now}.model')
         print(f'Total validation loss={total_validation_loss}')
         if total_validation_loss < best_validation_loss and log:
             torch.save(earl.state_dict(), f'models/best_earl_{now}.model')

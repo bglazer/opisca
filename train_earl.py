@@ -181,7 +181,7 @@ print(now, file=log)
 
 params = {
     'lr':.001,
-    'n_steps':5000,
+    'n_steps':15000,
     'layers':[('SAGEConv', {'out_channels':128}),
               ('SAGEConv', {'out_channels':128}),
               ('SAGEConv', {'out_channels':128}),
@@ -190,7 +190,7 @@ params = {
               #('TransformerConv', {'out_channels':32, 'heads':2})],
     'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
                'dim_inner': 512, 'num_layers':3},
-    'train_batch_size': 10,
+    'train_batch_size': 5,
     'validation_batch_size': 100,
     'checkpoint': 25,
     'atac_ones_weight': 1,
@@ -327,33 +327,33 @@ def compute_loss(prediction, y, target, mask):
 tasks = list(train_cell_idxs.keys())
 
 print('Starting training', file=log)
-# TODO mix tasks during one batch in training
 for batch_idx in range(n_steps):
-    task = random.choice(tasks)
-    batch = random.sample(train_cell_idxs[task], k=train_batch_size)
-    
-    source,target = task
-    mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
-    mask[graph_idxs[task][1][:,1]] = 1
+    #task = random.choice(tasks)
     optimizer.zero_grad()
-    batch_zero_loss = 0.0
-    batch_value_loss = 0.0
-    batch_prediction_loss = 0.0
-    for idx in batch:
-        # only one prediction at a time, minimizes memory usage
-        prediction, y = predict(earl, graph, task, [idx], mask)[0]
-        losses = compute_loss(prediction, y[mask], target, mask) 
-        loss, prediction_loss, value_loss, zero_loss = losses
-        loss.backward()
+    for task in tasks:
+        batch = random.sample(train_cell_idxs[task], k=train_batch_size)
+        
+        source,target = task
+        mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
+        mask[graph_idxs[task][1][:,1]] = 1
+        batch_zero_loss = 0.0
+        batch_value_loss = 0.0
+        batch_prediction_loss = 0.0
+        for idx in batch:
+            # only one prediction at a time, minimizes memory usage
+            prediction, y = predict(earl, graph, task, [idx], mask)[0]
+            losses = compute_loss(prediction, y[mask], target, mask) 
+            loss, prediction_loss, value_loss, zero_loss = losses
+            loss.backward()
 
-        batch_zero_loss += float(zero_loss)/len(batch)
-        batch_value_loss += float(value_loss)/len(batch)
-        batch_prediction_loss += float(prediction_loss)/len(batch)
+            batch_zero_loss += float(zero_loss)/len(batch)
+            batch_value_loss += float(value_loss)/len(batch)
+            batch_prediction_loss += float(prediction_loss)/len(batch)
 
-    print(f'Batch={batch_idx}', file=log)
-    print(f'train zero one loss {task}={batch_zero_loss}', file=log) 
-    print(f'train value loss {task}={batch_value_loss}',flush=True, file=log)
-    print(f'train prediction loss {task}={batch_prediction_loss}',flush=True, file=log)
+        print(f'Batch={batch_idx}', file=log)
+        print(f'train zero one loss {task}={batch_zero_loss}', file=log) 
+        print(f'train value loss {task}={batch_value_loss}',flush=True, file=log)
+        print(f'train prediction loss {task}={batch_prediction_loss}',flush=True, file=log)
     optimizer.step()
 
     # Checkpoint

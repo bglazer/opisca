@@ -4,24 +4,25 @@ import sys
 import json
 from datetime import datetime
 from math import sqrt
-import torch
-import numpy as np
-import scanpy
-from collections import defaultdict
+from collections import defaultdict, Counter
 import pickle
 import random
-from collections import Counter
-from torch.nn import Linear, LeakyReLU, Sigmoid, BCELoss
-from torch_geometric.nn import GATConv, HeteroConv, SAGEConv, GATv2Conv, TransformerConv
-from torch_geometric.data import HeteroData
-import torch_geometric
+from copy import deepcopy
+
+import numpy as np
+import scanpy
+
+import torch
 from torch import tensor
 from torch.autograd import Variable
 import torch.nn.functional as F
+from torch.nn import Linear, LeakyReLU, Sigmoid, BCELoss
 from torch.distributions import Bernoulli
-from torch_geometric.graphgym.models import MLP
-from copy import deepcopy
 
+from torch_geometric.nn import GATConv, HeteroConv, SAGEConv, GATv2Conv, TransformerConv
+from torch_geometric.data import HeteroData
+from torch_geometric.graphgym.models import MLP
+import torch_geometric
 
 def proteins_to_idxs(data):
     indexes = []
@@ -185,7 +186,7 @@ print(now, file=log)
 params = {
     'mode':'reptile',
     'inner_lr': .01,
-    'outer_lr': .1,
+    'outer_lr': .001,
     'inner_steps': 5,
     'n_steps': 10000,
     'layers':[('SAGEConv', {'out_channels':128}),

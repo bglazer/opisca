@@ -1,18 +1,19 @@
 from torch_geometric.data import HeteroData
 import torch_geometric
 import torch
+from math import log, ceil, sqrt
 
 class HeteroLoader():
     def __init__(self, graph, device):
         self.graph = graph
         self.device = device
 
-    def sample(self, task, ids, n_steps):
-        layers = self.forward(task, ids, n_steps)
+    def sample(self, task, ids, n_steps, random_sample=False):
+        layers = self.forward(task, ids, n_steps, random_sample=random_sample)
         layers = self.backward(task, ids, layers)
         return layers
 
-    def forward(self, task, ids, n_steps): #, batch_size=None):
+    def forward(self, task, ids, n_steps, random_sample=False):
         with torch.no_grad():
             sources = {task[1]: ids}
             all_nodes = {}
@@ -38,14 +39,24 @@ class HeteroLoader():
                                 if idx not in visited[relation]:
                                     visited[relation].add(idx)
                                     match_mask = (edge_index[0]==idx).flatten()
-                                    matching_edges = edge_index[:,match_mask]
                                     self.update_mask(edge_masks, relation, match_mask)
-                                    self.append_sources(next_sources, dst, matching_edges[1])
 
                 new_graph = HeteroData()
                 for relation in edge_masks:
                     mask = edge_masks[relation]
+                    if random_sample:
+                        true_idxs = torch.arange(0,len(mask), device=self.device, dtype=int)
+                        true_idxs = true_idxs[mask]
+                        # plus 2 so that we always sample at least 1, int(log(1+2))=1
+                        n_samples = ceil(sqrt(len(true_idxs)))
+                        sample_idxs = torch.randperm(len(true_idxs), device=self.device)[:n_samples]
+                        mask = torch.zeros(mask.shape, device=self.device, dtype=bool)
+                        mask[true_idxs[sample_idxs]] = True
+                        
                     new_graph[relation].edge_index = self.graph[relation].edge_index[:,mask]
+                    neighbors = new_graph[relation].edge_index[1]
+                    next_source, _, dst = relation
+                    self.append_sources(next_sources, dst, neighbors)
 
                 layers.append(new_graph)
                 sources = next_sources

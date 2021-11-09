@@ -8,22 +8,22 @@ from collections import defaultdict
 import pickle
 import random
 from collections import Counter
-from copy import deepcopy
 
-import numpy as np
 import scanpy
-
-import torch
-from torch import tensor
-import torch.nn.functional as F
-from torch.nn import Linear, LeakyReLU, Sigmoid, BCELoss
-from torch.distributions import Bernoulli
+import numpy as np
 
 import torch_geometric
 from torch_geometric.nn import GATConv, HeteroConv, SAGEConv, GATv2Conv, TransformerConv
 from torch_geometric.data import HeteroData
 from torch_geometric.graphgym.models import MLP
-from torch_geometric.loader import NeighborLoader, HGTLoader
+
+import torch
+from torch import tensor
+from torch.distributions import Bernoulli
+from torch.nn import Linear, LeakyReLU, Sigmoid, BCELoss
+import torch.nn.functional as F
+
+from loader import HeteroPathSampler
 
 
 def proteins_to_idxs(data):
@@ -53,7 +53,7 @@ def atacs_to_idxs(data):
 
 def expand_for_data(graph):
     with torch.no_grad():
-        for node_type in ['gene', 'atac_region']:
+        for node_type in ['gene', 'atac_region', 'protein_name']:
             graph[node_type].x = torch.cat([
                 graph[node_type].x,
                 torch.ones((len(node_idxs[node_type]),1),device=device)
@@ -64,7 +64,6 @@ def expand_for_data(graph):
 def add_expression(graph, cell_idx, task):
     source, target = task
     with torch.no_grad():
-        graph['protein_name'].x = torch.ones((len(node_idxs['protein_name']),1), device=device)*-1
         # 128 is the feature size from the node2vec
         # multiply by 128 so the expression has roughly the same magnitude as 
         # the rest of the features combined
@@ -75,54 +74,70 @@ def add_expression(graph, cell_idx, task):
 
         graph[source].x[src_idxs[:,1],-1] = src_expr[0,src_idxs[:,0]]
 
-        y = torch.ones((len(node_idxs[target]),1), device=device)*-1
-        y[tgt_idxs[:,1],-1] = tgt_expr[0,tgt_idxs[:,0]]
+        graph[target].y = torch.ones((len(node_idxs[target]),1), device=device)*-1
+        graph[target].y[tgt_idxs[:,1],-1] = tgt_expr[0,tgt_idxs[:,0]]
 
-        for node_type in ['gene','atac_region']:
+        for node_type in ['gene','atac_region','protein_name']:
             if node_type not in (source, target):
                 graph[node_type].x[:,-1] = torch.ones((len(node_idxs[node_type])), device=device)*-1
 
-        return graph, y
+        return graph
     
 
 class EaRL(torch.nn.Module):
-    def __init__(self, gnn_layers, out_mlp):
+    def __init__(self, gnn_layers, out_mlp, device):
         super().__init__()
 
-        self.convs = torch.nn.ModuleList()
+        #self.convs = torch.nn.ModuleList()
         self.sigmoid = Sigmoid()
         # This is a little shim that gets around us not being able to json dump 
         # the class of the layer (i.e GATConv) in the param dictionary
         layer_classes = {'GATConv':GATConv, 'SAGEConv':SAGEConv,
                          'TransformerConv':TransformerConv}
 
-        for layer_type, params in gnn_layers:
-            layer_type = layer_classes[layer_type]
-            conv = HeteroConv({
-                ('tad', 'overlaps', 'atac_region'): layer_type(**params, in_channels=(-1,-1)),
-                ('atac_region', 'rev_overlaps', 'tad'): layer_type(**params, in_channels=(-1,-1)),
-                ('tad', 'overlaps', 'gene'): layer_type(**params, in_channels=(-1,-1)),
-                ('gene', 'rev_overlaps', 'tad'): layer_type(**params, in_channels=(-1,-1)),
-                ('atac_region', 'overlaps', 'gene'): layer_type(**params, in_channels=(-1,-1)),
-                ('gene', 'rev_overlaps', 'atac_region'): layer_type(**params, in_channels=(-1,-1)),
-                # Not bipartite so we have just (-1) for in channels, same feature sizes for both
-                ('protein', 'coexpressed', 'protein'): layer_type(**params, in_channels=-1),
-                ('protein', 'tf_interacts', 'gene'): layer_type(**params, in_channels=(-1,-1)),
-                ('gene', 'rev_tf_interacts', 'protein'): layer_type(**params, in_channels=(-1,-1)),
-                ('protein', 'rev_associated', 'gene'): layer_type(**params, in_channels=(-1,-1)),
-                ('gene', 'associated', 'protein'): layer_type(**params, in_channels=(-1,-1)),
-                ('protein', 'is_named', 'protein_name'): layer_type(**params, in_channels=(-1,-1)),
-                ('protein_name', 'rev_is_named', 'protein'): layer_type(**params, in_channels=(-1,-1)),
-                ('enhancer','overlaps','atac_region'): layer_type(**params, in_channels=(-1,-1)),
-                ('atac_region','rev_overlaps','enhancer'): layer_type(**params, in_channels=(-1,-1)),
-                ('enhancer','associated','gene'): layer_type(**params, in_channels=(-1,-1)),
-                ('gene','rev_associated','enhancer'): layer_type(**params, in_channels=(-1,-1)),
-                ('atac_region','neighbors','gene'): layer_type(**params, in_channels=(-1,-1)),
-                ('gene','rev_neighbors','atac_region'): layer_type(**params, in_channels=(-1,-1)),
+        #for layer_type, params in gnn_layers:
+        #layer_type = layer_classes[layer_type]
+        _, params = gnn_layers[0]
+        layer_type = SAGEConv
+        self.convs = {
+            ('tad', 'overlaps', 'atac_region'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('atac_region', 'rev_overlaps', 'tad'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('tad', 'overlaps', 'gene'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('gene', 'rev_overlaps', 'tad'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('atac_region', 'overlaps', 'gene'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('gene', 'rev_overlaps', 'atac_region'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            # Not bipartite so we have just (-1) for in channels, same feature sizes for both
+            ('protein', 'coexpressed', 'protein'): layer_type(**params, in_channels=-1).to(device),
+            ('protein', 'tf_interacts', 'gene'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('gene', 'rev_tf_interacts', 'protein'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('protein', 'rev_associated', 'gene'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('gene', 'associated', 'protein'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('protein', 'is_named', 'protein_name'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('protein_name', 'rev_is_named', 'protein'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('enhancer','overlaps','atac_region'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('atac_region','rev_overlaps','enhancer'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('enhancer','associated','gene'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('gene','rev_associated','enhancer'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('atac_region','neighbors','gene'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('gene','rev_neighbors','atac_region'): layer_type(**params, in_channels=(-1,-1)).to(device),
+        }
+        self.self_linear = {
+            'protein': Linear(params['out_channels'], params['out_channels']).to(device),
+            'protein_name': Linear(params['out_channels'], params['out_channels']).to(device),
+            'tad': Linear(params['out_channels'], params['out_channels']).to(device),
+            'atac_region': Linear(params['out_channels'], params['out_channels']).to(device),
+            'gene': Linear(params['out_channels'], params['out_channels']).to(device),
+            'enhancer': Linear(params['out_channels'], params['out_channels']).to(device),
+        }
 
-            })
-
-            self.convs.append(conv)
+        # TODO input dimensionality needs to be a parameter or inferred from data
+        # TODO it's hardcoded right now to be +1 of the conv output dimensionality, which is likely to break
+        # TODO don't need to change out_channels, that should be the same as the input to the convs
+        self.input_linear = {
+            'protein_name': Linear(129, params['out_channels']).to(device),
+            'atac_region': Linear(257, params['out_channels']).to(device),
+            'gene': Linear(129, params['out_channels']).to(device),
+        }
 
         self.protein_zero  = MLP(**out_mlp) 
         self.protein_value = MLP(**out_mlp)
@@ -132,34 +147,50 @@ class EaRL(torch.nn.Module):
 
         self.atac_zero = MLP(**out_mlp) 
 
-    def encode(self, x_dict, edge_index_dict):
-        for conv in self.convs:
-            x_dict = conv(x_dict, edge_index_dict)
-            x_dict = {key: x.relu() for key, x in x_dict.items()}
-        return x_dict
+    def encode(self, x_dict, layers, source):
+        new_x = {k:v.detach().clone() for k,v in x_dict.items()}
+        for data_type, linear in self.input_linear.items():
+            new_x[data_type] = linear(new_x[data_type])
+            
+        for layer in layers:
+            subconv = HeteroConv({relation: conv for relation,conv in self.convs.items()
+                                    if relation in layer._edge_store_dict})
 
-    def gene(self, x_dict, edge_index_dict):
-        x_dict = self.encode(x_dict, edge_index_dict)
+            new_x = subconv(new_x, layer.edge_index_dict)
+
+            for dst in x_dict:
+                # if transformed by subconv, then also add self loops
+                if dst in new_x:
+                    mask = layer[dst].targets
+                    # TODO this breaks our dimensionality, can't use x_dict
+                    self_looped = x_dict[dst].detach().clone()
+                    self_looped[mask] = self.self_linear[dst](self_looped[mask])
+                    new_x[dst] = self_looped + new_x[dst]
+                    new_x[dst][mask] = new_x[dst][mask].relu()
+                # just copy from old x
+                else:
+                    new_x[dst] = x_dict[dst].detach().clone()
+        return new_x
+
+    def gene(self, x_dict):
         x_dict['p_zero'] = self.sigmoid(self.gene_zero(x_dict['gene']))
         x_dict['zeros'] = Bernoulli(x_dict['p_zero']).sample()
         x_dict['values'] = self.gene_value(x_dict['gene'])
         return x_dict
 
-    def atac(self, x_dict, edge_index_dict):
-        x_dict = self.encode(x_dict, edge_index_dict)
+    def atac(self, x_dict):
         x_dict['p_zero'] = self.sigmoid(self.atac_zero(x_dict['atac_region']))
-        x_dict['zeros'] = Bernoulli(x_dict['p_zero']).sample()
         return x_dict
 
-    def protein_name(self, x_dict, edge_index_dict):
-        x_dict = self.encode(x_dict, edge_index_dict)
+    def protein_name(self, x_dict):
         x_dict['p_zero'] = self.sigmoid(self.protein_zero(x_dict['protein_name']))
         x_dict['zeros'] = Bernoulli(x_dict['p_zero']).sample()
         x_dict['values'] = self.protein_value(x_dict['protein_name'])
         return x_dict
     
-    def forward(self, x_dict, edge_index_dict, task):
+    def forward(self, x_dict, layers, task):
         source, target = task
+        x_dict = self.encode(x_dict, layers, source)
         if target == 'gene':
             x = self.gene(x_dict, edge_index_dict)
         if target == 'protein_name':
@@ -186,26 +217,22 @@ print('Starting', file=log)
 print(now, file=log)
 
 params = {
-    'mode':'reptile',
-    'sampling':True,
-    'inner_lr': .01,
-    'outer_lr': .1,
-    'inner_steps': 5,
-    'n_steps': 10000,
-    'layers':[('GATConv', {'out_channels':32, 'heads':2, 'concat':False}),
-              ('GATConv', {'out_channels':32, 'heads':2, 'concat':False}),
-              ('GATConv', {'out_channels':32, 'heads':2, 'concat':False}),
-              ('GATConv', {'out_channels':32, 'heads':2, 'concat':False})],
-              #('SAGEConv', {'out_channels':64}),
-              #('SAGEConv', {'out_channels':128})],
-    'out_mlp':{'dim_in':32, 'dim_out':1, 'bias':True, 
+    'lr':.001,
+    'n_steps':15000,
+    'layers':[('SAGEConv', {'out_channels':128, 'root_weight':False, 'bias':False, 'normalize':False}),
+              ('SAGEConv', {'out_channels':128}),
+              ('SAGEConv', {'out_channels':128}),
+              ('SAGEConv', {'out_channels':128}),
+              ('SAGEConv', {'out_channels':128})],
+              #('TransformerConv', {'out_channels':32, 'heads':2})],
+    'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
                'dim_inner': 512, 'num_layers':3},
-    'train_batch_cells': 10,
-    'validation_batch_cells': 10,
-    'checkpoint': 40,
+    'train_batch_size': 5,
+    'validation_batch_size': 100,
+    'checkpoint': 25,
     'atac_ones_weight': 1,
     'gene_ones_weight': 1,
-    'target_heads': False,
+    'n_sample_steps': 5,
     'device': device,
 }
 
@@ -264,16 +291,13 @@ def get_mask(graph, task):
 
 
 print('Initializing EaRL', file=log)
-earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'])
-earl = earl.to(device)
+earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'], device=device)
 
-
+optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['lr'])
 earl.train()
 
 n_steps = params['n_steps']
 checkpoint = params['checkpoint']
-
-# TODO trim the gene names, we have way more gene names than we have in the data
 
 train_cell_idxs = {}
 validation_cell_idxs = {}
@@ -286,18 +310,35 @@ for task in expression:
     train_cell_idxs[task] = cell_idxs[:train_set_size]
     validation_cell_idxs[task] = cell_idxs[train_set_size:]
 
-train_batch_cells = params['train_batch_cells']
-validation_batch_cells = params['validation_batch_cells']
+train_batch_size = params['train_batch_size']
+validation_batch_size = params['validation_batch_size']
+
+bce_loss = BCELoss()
 
 best_validation_loss = float('inf')
 
-def predict(earl, graph, task, eval=False):
-    context = torch.no_grad() if eval else torch.enable_grad()
-    with context:
-        output = earl(graph.x_dict, graph.edge_index_dict, task)
+loader = HeteroPathSampler(graph, device)
+n_sample_steps = params['n_sample_steps']
 
-        return output
-        
+def predict(earl, graph, task, cell_idxs, target_idxs, mask, eval=False):
+    source,target = task
+    with torch.inference_mode(eval):
+        predictions = []
+
+        for cell_idx in cell_idxs:
+            newgraph = add_expression(graph, cell_idx, task)
+            # sample a subgraph
+            # TODO batching
+            for target_idx in target_idxs:
+                subgraph = loader.sample(task, [target_idx], n_steps=n_sample_steps, random_sample=True)
+                # TODO avoid possible infinite loop?
+                # TODO loosen random sampling?
+                while subgraph[0].num_edges == 0:
+                    subgraph = loader.sample(task, [target_idx], n_steps=n_sample_steps, random_sample=True)
+                output = earl(newgraph.x_dict, subgraph, task)
+                predictions.append((output, graph[target].y))
+
+        return predictions
 
 def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
@@ -313,9 +354,7 @@ def compute_loss(prediction, y, target, mask):
     if target == 'atac_region':
         bce_loss = BCELoss(weight=1+y_zero*params['atac_ones_weight'])
         loss = bce_loss(p_zeros, y_zero.float())
-        zeros = prediction['zeros'][mask]
-        prediction_loss = float(((zeros - y)**2).mean())
-        return loss, prediction_loss, 0, loss
+        return loss, loss, 0, loss
 
     if target in ['gene', 'protein_name']:
         if target=='gene':
@@ -330,36 +369,25 @@ def compute_loss(prediction, y, target, mask):
         loss = zero_loss + value_loss
         return loss, prediction_loss, value_loss, zero_loss
 
+tasks = list(train_cell_idxs.keys())
 
-
-def inner_loop(earl, task, batch, batch_type, verbose=True):
-    source,target = task
-
-    mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
-    #mask[graph_idxs[task][1][:,1]] = 1
-    mask[2] = 1 
-
-    inner_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['inner_lr'])
-    inner_optimizer.zero_grad()
-
-    batch_zero_loss = 0.0
-    batch_value_loss = 0.0
-    batch_prediction_loss = 0.0
-
-    for cell_idx in batch:
-        newgraph, y = add_expression(graph, cell_idx, task)
-        breakpoint()
-        # TODO need to find masked items that aren't connected to anything
-        train_loader = NeighborLoader(newgraph,
-                                      #num_samples=[10]*2,
-                                      num_neighbors=[1],
-                                      batch_size=1,
-                                      input_nodes=(target, mask.flatten())
-                                     )
-
-        for minibatch in train_loader:
+print('Starting training', file=log)
+for batch_idx in range(n_steps):
+    #task = random.choice(tasks)
+    optimizer.zero_grad()
+    for task in tasks:
+        cell_batch = random.sample(train_cell_idxs[task], k=train_batch_size)
+        target_batch = random.sample(range(expression[task][1].shape[0]), k=train_batch_size)
+        
+        source,target = task
+        mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
+        mask[graph_idxs[task][1][:,1]] = 1
+        batch_zero_loss = 0.0
+        batch_value_loss = 0.0
+        batch_prediction_loss = 0.0
+        for cell_idx in cell_batch:
             # only one prediction at a time, minimizes memory usage
-            prediction = predict(earl, newgraph, task)
+            prediction, y = predict(earl, graph, task, cell_idxs=[cell_idx], target_idxs=target_batch, mask=mask)[0]
             losses = compute_loss(prediction, y[mask], target, mask) 
             loss, prediction_loss, value_loss, zero_loss = losses
             loss.backward()
@@ -368,120 +396,61 @@ def inner_loop(earl, task, batch, batch_type, verbose=True):
             batch_value_loss += float(value_loss)/len(batch)
             batch_prediction_loss += float(prediction_loss)/len(batch)
 
-    inner_optimizer.step()
-    if verbose:
-        print(f'{batch_type} zero one loss {task}={batch_zero_loss}', file=log) 
-        print(f'{batch_type} value loss {task}={batch_value_loss}',flush=True, file=log)
-        print(f'{batch_type} prediction loss {task}={batch_prediction_loss}',flush=True, file=log)
+        print(f'Batch={batch_idx}', file=log)
+        print(f'train zero one loss {task}={batch_zero_loss}', file=log) 
+        print(f'train value loss {task}={batch_value_loss}',flush=True, file=log)
+        print(f'train prediction loss {task}={batch_prediction_loss}',flush=True, file=log)
+    optimizer.step()
 
-
-
-tasks = list(train_cell_idxs.keys())
-task_iter = iter(tasks)
-outer_optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['outer_lr'])
-
-print('Starting training', file=log)
-outer_lr = params['outer_lr']
-
-# dummy batch to initialize parameters
-task = tasks[0]
-source,target = task
-idx = 0
-mask = torch.ones((len(node_idxs[target]),1), dtype=bool, device=device)
-add_expression(graph, idx, task)
-predict(earl, graph, task, eval=True)
-
-
-#for iteration 1,2,3,…do
-for step_idx in range(n_steps):
-    # ParallelDataLoader here?
-    # some data loader from learn2learn?
-    #  Randomly sample a task T
-    task = next(task_iter, None)
-    if task is None:
-        task_iter = iter(random.sample(tasks, k=len(tasks)))
-        task = next(task_iter, None)
-    source, target = task
-
-    weights_before = deepcopy(earl.state_dict())
-    # Inner updates
-    print(f'Outer step={step_idx}', file=log)
-    for inner_step in range(params['inner_steps']-1):
-        print(f'Inner step={inner_step}', file=log, flush=True)
-        batch = random.sample(train_cell_idxs[task], k=train_batch_cells)
-        inner_loop(earl, task, batch, 'train', verbose=False)
-    batch = random.sample(train_cell_idxs[task], k=train_batch_cells)
-    inner_loop(earl, task, batch, 'train', verbose=True)
-
-    weights_after = earl.state_dict()
-    # TODO evaluation batch after inner loops?
-
-    # Outer update
-    # Update: Φ←Φ+ϵ(W−Φ)
-    # TODO explicitly set grad to diff, pass to ADAM
-    new_state = {}
-    for name in weights_before:
-        before = weights_before[name]
-        after = weights_after[name]
-        diff = after-before
-        # Don't apply outer loop to task specific heads
-        if params['target_heads'] and f'{target}_value' in name or f'{target}_zero' in name:
-            new_state[name] = after
-            # TODO for ADAM just set requires_grad = False
-        else:
-            updated = before + diff * outer_lr
-            new_state[name] = updated
-    earl.load_state_dict(new_state)
-    # TODO learning rate decay
-    
     # Checkpoint
-    if (step_idx+1) % checkpoint == 0:
-        # Save state before validation training
-        weights_before = deepcopy(earl.state_dict())
+    if (batch_idx) % checkpoint == 0:
         print('Checkpoint', file=log)
-        #earl.eval()
+        earl.eval()
         if prediction_log:
             prediction_log.truncate(0)
+
         for task in tasks:
             source,target = task
             total_validation_loss = 0.0
 
-            # Inner updates
-            for inner_step in range(params['inner_steps']-1):
-                batch = random.sample(validation_cell_idxs[task], k=validation_batch_cells)
-                weights_after = inner_loop(earl, task, batch, 'validation', verbose=False)
-            batch = random.sample(validation_cell_idxs[task], k=validation_batch_cells)
+            mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
+            mask[graph_idxs[task][1][:,1]] = 1
 
-            #idx = random.sample(validation_cell_idxs[task], k=1)
-            #mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
-            #mask[graph_idxs[task][1][:,1]] = 1
-            #earl.eval()
-            #prediction = predict(earl, graph, task, eval=True)
-            #y=y[mask]
+            idxs = random.sample(validation_cell_idxs[task], k=validation_batch_size)
+            validation_loss = 0.0
+            zero_loss = 0.0
+            value_loss = 0.0
+            for idx in idxs:
+                prediction, y = predict(earl, graph, task, [idx], mask, eval=True)[0]
+                y = y[mask].flatten()
+                losses = compute_loss(prediction, y, target, mask) 
+                _, _validation_loss, _value_loss, _zero_loss = losses
+                zero_loss += _zero_loss/len(idxs)
+                value_loss += _value_loss/len(idxs)
+                validation_loss += _validation_loss/len(idxs)
+            print(f'validation zero one loss {task}={float(zero_loss)}', file=log) 
+            print(f'validation value loss {task}={float(value_loss)}',flush=True, file=log)
+            print(f'validation prediction loss {task}={validation_loss}',flush=True, file=log)
+            total_validation_loss += validation_loss
 
-            ## Print a sample of predictions
-            #if target == 'atac_region':
-            #    zeros = prediction['zeros'][mask]
-            #    p_zeros = prediction['p_zero'][mask]
-            #    stacked = torch.vstack([p_zeros, y])
+            if target == 'atac_region':
+                p_zeros = prediction['p_zero'][mask]
+                stacked = torch.vstack([p_zeros, y])
 
-            #if target in ['gene', 'protein_name']:
-            #    zeros = prediction['zeros'][mask]
-            #    values = prediction['values'][mask]
-            #    stacked = torch.vstack([values*zeros, y])
+            if target in ['gene', 'protein_name']:
+                zeros = prediction['zeros'][mask]
+                values = prediction['values'][mask]
+                stacked = torch.vstack([values*zeros, y])
 
-            #print('-'*80, file=prediction_log)
-            #print(f'Task: {task}', file=prediction_log)
-            #print('-'*80, file=prediction_log)
-            #for i in range(min(stacked.shape[1], 300)):
-            #    print(f'batch {step_idx} {i:<6d} pred,y: '+
-            #          f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
-            #          file=prediction_log, flush=True)
+            print('-'*80, file=prediction_log)
+            print(f'Task: {task}', file=prediction_log)
+            print('-'*80, file=prediction_log)
+            for i in range(min(stacked.shape[1], 300)):
+                print(f'batch {batch_idx} {i:<6d} pred,y: '+
+                      f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
+                      file=prediction_log, flush=True)
 
-            # Reset weights to initial state before tuning (inner loops) on this task
-            earl.load_state_dict(weights_before)
-
-        print(f'Total validation loss={total_validation_loss}')
+        torch.save(earl.state_dict(), f'models/latest_earl_{now}.model')
         if total_validation_loss < best_validation_loss and log:
             torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
             best_validation_loss = total_validation_loss

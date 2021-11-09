@@ -3,7 +3,7 @@ import torch_geometric
 import torch
 from math import log, ceil, sqrt
 
-class HeteroLoader():
+class HeteroPathSampler():
     def __init__(self, graph, device):
         self.graph = graph
         self.device = device
@@ -102,11 +102,14 @@ class HeteroLoader():
                     relation, edge_index = self.reverse(relation, edge_index)
                     new_graph[relation].edge_index = edge_index[:,mask]
 
-                new_layers.append(new_graph)
                 sources = next_sources
-
                 for src in sources:
                     sources[src] = sources[src].unique()
+                    mask = torch.zeros(self.graph[src].x.shape[0], dtype=bool, device=self.device)
+                    mask[sources[src]] = True
+                    new_graph[src].targets = mask
+
+                new_layers.append(new_graph)
                 
                 step -= 1 
 

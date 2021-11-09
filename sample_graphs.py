@@ -1,4 +1,5 @@
 import torch
+import torch_geometric
 from torch import tensor
 import scanpy
 import pickle
@@ -34,6 +35,9 @@ device = 'cuda:3'
 print('Loading graph')
 node_idxs = pickle.load(open('input/nodes_by_type.pickle','rb'))
 graph = torch.load('input/graph_with_embeddings.torch').to(device)
+graph = graph.to('cpu')
+graph = torch_geometric.transforms.ToUndirected()(graph)
+graph = graph.to(device)
 
 print('Loading protein/gene data')
 datadir = 'output/datasets/predict_modality/openproblems_bmmc_cite_phase1_mod2/'
@@ -45,9 +49,20 @@ datafile = 'openproblems_bmmc_cite_phase1_mod2.censor_dataset.output_train_mod2.
 gene_data = scanpy.read_h5ad(datadir+datafile)
 gene_idxs, gene_expression = genes_to_idxs(gene_data)
 
-idx = 0 #protein_idxs[0]
-print('protein idx', idx)
+loader = HeteroLoader(graph, device)
 
-loader = HeteroLoader(graph)
-layers=loader.sample('protein', [idx], 2)
-breakpoint()
+task = ('gene','protein_name')
+for idx in protein_idxs[:,0]:
+    print('protein idx', idx)
+    sampled_graph = loader.sample(task, [idx], 4)
+    print(sampled_graph)
+    print('-='*40)
+    torch.save(sampled_graph, f'input/graph_samples/{task[0]}_{task[1]}_{idx}.graph')
+
+task = ('protein_name','gene')
+for idx in gene_idxs[:,0]:
+    print('gene idx', idx)
+    sampled_graph = loader.sample(task, [idx], 4)
+    print(sampled_graph)
+    print('-='*40)
+    torch.save(sampled_graph, f'input/graph_samples/{task[0]}_{task[1]}_{idx}.graph')

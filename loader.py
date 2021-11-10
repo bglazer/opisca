@@ -8,12 +8,12 @@ class HeteroPathSampler():
         self.graph = graph
         self.device = device
 
-    def sample(self, task, ids, n_steps, random_sample=False):
-        layers = self.forward(task, ids, n_steps, random_sample=random_sample)
+    def sample(self, task, ids, n_steps, sampling_factor=None):
+        layers = self.forward(task, ids, n_steps, sampling_factor)
         layers = self.backward(task, ids, layers)
         return layers
 
-    def forward(self, task, ids, n_steps, random_sample=False):
+    def forward(self, task, ids, n_steps, sampling_factor):
         with torch.no_grad():
             sources = {task[1]: ids}
             all_nodes = {}
@@ -44,11 +44,10 @@ class HeteroPathSampler():
                 new_graph = HeteroData()
                 for relation in edge_masks:
                     mask = edge_masks[relation]
-                    if random_sample:
+                    if sampling_factor:
                         true_idxs = torch.arange(0,len(mask), device=self.device, dtype=int)
                         true_idxs = true_idxs[mask]
-                        # plus 2 so that we always sample at least 1, int(log(1+2))=1
-                        n_samples = ceil(sqrt(len(true_idxs)))
+                        n_samples = ceil(sqrt(len(true_idxs)**sampling_factor))
                         sample_idxs = torch.randperm(len(true_idxs), device=self.device)[:n_samples]
                         mask = torch.zeros(mask.shape, device=self.device, dtype=bool)
                         mask[true_idxs[sample_idxs]] = True
@@ -56,7 +55,7 @@ class HeteroPathSampler():
                     new_graph[relation].edge_index = self.graph[relation].edge_index[:,mask]
                     neighbors = new_graph[relation].edge_index[1]
                     next_source, _, dst = relation
-                    self.append_sources(next_sources, dst, neighbors)
+                    self.append_ids(next_sources, dst, neighbors)
 
                 layers.append(new_graph)
                 sources = next_sources
@@ -77,37 +76,50 @@ class HeteroPathSampler():
             while step >= 0:
                 edge_masks = {}
                 layer = layers[step]
-                next_sources = {}
+                srcs = {}
+                dests = {}
                 relations = layer._edge_store_dict
                 for relation, edges in relations.items():
                     edge_index = edges.edge_index
-                    src, _, dst = relation
-                    if dst == source:
+                    dst, _, src = relation
+                    if src == source:
                         full_mask = torch.ones_like(edge_index[0], dtype=bool, device=self.device)
                         self.update_mask(edge_masks, relation, full_mask)
-                        self.append_sources(next_sources, src, edge_index[0])
-                    if dst in sources:
-                        ids = sources[dst]
+                        self.append_ids(dests, dst, edge_index[0])
+                        self.append_ids(srcs, src, edge_index[1])
+                    if src in sources:
+                        ids = sources[src]
                         for idx in ids:
                             match_mask = (edge_index[1]==idx).flatten()
                             matching_edges = edge_index[:,match_mask]
                             self.update_mask(edge_masks, relation, match_mask)
-                            self.append_sources(next_sources, src, matching_edges[0])
-                        #breakpoint()
+                            self.append_ids(dests, dst, matching_edges[0])
+                            self.append_ids(srcs, src, matching_edges[1])
 
                 new_graph = HeteroData()
+                sources = dests
+                all_nodes = {}
+                
+                for node_type in srcs:
+                    self.append_ids(all_nodes, node_type, srcs[node_type].unique())
+
+                for node_type in sources:
+                    sources[node_type] = sources[node_type].unique()
+                    self.append_ids(all_nodes, node_type, sources[node_type])
+                    all_nodes[node_type] = all_nodes[node_type].unique()
+
+                for node_type in all_nodes:
+                    new_graph[node_type].x = self.graph[node_type].x[all_nodes[node_type]]
+                    new_graph[node_type].x_map = all_nodes[node_type]
+
                 for relation in edge_masks:
                     mask = edge_masks[relation]
-                    edge_index = relations[relation].edge_index
+                    edge_index = relations[relation].edge_index[:,mask]
                     relation, edge_index = self.reverse(relation, edge_index)
-                    new_graph[relation].edge_index = edge_index[:,mask]
-
-                sources = next_sources
-                for src in sources:
-                    sources[src] = sources[src].unique()
-                    mask = torch.zeros(self.graph[src].x.shape[0], dtype=bool, device=self.device)
-                    mask[sources[src]] = True
-                    new_graph[src].targets = mask
+                    src,_,dst = relation
+                    edge_index[0] = remap(edge_index[0], new_graph[src].x_map)
+                    edge_index[1] = remap(edge_index[1], new_graph[dst].x_map)
+                    new_graph[relation].edge_index = edge_index
 
                 new_layers.append(new_graph)
                 
@@ -143,10 +155,14 @@ class HeteroPathSampler():
 
         edge_masks[relation] += edges
 
-    def append_sources(self, next_sources, src, neighbors):
-        if len(neighbors) == 0:
+    def append_ids(self, ids, node_type, new):
+        if len(new) == 0:
             return
 
-        if src not in next_sources:
-            next_sources[src] = torch.empty((0,), device=self.device, dtype=int)
-        next_sources[src] = torch.cat([next_sources[src], neighbors])
+        if node_type not in ids:
+            ids[node_type] = torch.empty((0,), device=self.device, dtype=int)
+        ids[node_type] = torch.cat([ids[node_type], new])
+
+def remap(keys, ids):
+    return torch.bucketize(keys, ids)
+

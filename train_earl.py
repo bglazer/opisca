@@ -15,16 +15,23 @@ import numpy as np
 import torch_geometric
 from torch_geometric.nn import GATConv, HeteroConv, SAGEConv, GATv2Conv, TransformerConv
 from torch_geometric.data import HeteroData
-from torch_geometric.graphgym.models import MLP
+#from torch_geometric.graphgym.models import MLP
 
 import torch
 from torch import tensor
 from torch.distributions import Bernoulli
-from torch.nn import Linear, LeakyReLU, Sigmoid, BCELoss
+from torch.nn import Linear, LeakyReLU, Sigmoid, BCELoss, Sequential as Seq, ReLU
 import torch.nn.functional as F
 
-from loader import HeteroPathSampler
+from loader import HeteroPathSampler, remap
 
+def MLP(channels):
+    hidden = Seq(*[Seq(
+                    Linear(channels[i - 1], channels[i]), 
+                    ReLU())
+                   for i in range(1, len(channels)-1)])
+    final = Linear(channels[len(channels)-2], channels[len(channels)-1])
+    return Seq(hidden, final)
 
 def proteins_to_idxs(data):
     indexes = []
@@ -100,103 +107,121 @@ class EaRL(torch.nn.Module):
         _, params = gnn_layers[0]
         layer_type = SAGEConv
         self.convs = {
-            ('tad', 'overlaps', 'atac_region'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('atac_region', 'rev_overlaps', 'tad'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('tad', 'overlaps', 'gene'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('gene', 'rev_overlaps', 'tad'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('atac_region', 'overlaps', 'gene'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('gene', 'rev_overlaps', 'atac_region'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('tad', 'overlaps', 'atac_region'): layer_type(**params, in_channels=(-1,-1)),
+            ('atac_region', 'rev_overlaps', 'tad'): layer_type(**params, in_channels=(-1,-1)),
+            ('tad', 'overlaps', 'gene'): layer_type(**params, in_channels=(-1,-1)),
+            ('gene', 'rev_overlaps', 'tad'): layer_type(**params, in_channels=(-1,-1)),
+            ('atac_region', 'overlaps', 'gene'): layer_type(**params, in_channels=(-1,-1)),
+            ('gene', 'rev_overlaps', 'atac_region'): layer_type(**params, in_channels=(-1,-1)),
             # Not bipartite so we have just (-1) for in channels, same feature sizes for both
-            ('protein', 'coexpressed', 'protein'): layer_type(**params, in_channels=-1).to(device),
-            ('protein', 'tf_interacts', 'gene'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('gene', 'rev_tf_interacts', 'protein'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('protein', 'rev_associated', 'gene'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('gene', 'associated', 'protein'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('protein', 'is_named', 'protein_name'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('protein_name', 'rev_is_named', 'protein'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('enhancer','overlaps','atac_region'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('atac_region','rev_overlaps','enhancer'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('enhancer','associated','gene'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('gene','rev_associated','enhancer'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('atac_region','neighbors','gene'): layer_type(**params, in_channels=(-1,-1)).to(device),
-            ('gene','rev_neighbors','atac_region'): layer_type(**params, in_channels=(-1,-1)).to(device),
+            ('protein', 'coexpressed', 'protein'): layer_type(**params, in_channels=-1),
+            ('protein', 'tf_interacts', 'gene'): layer_type(**params, in_channels=(-1,-1)),
+            ('gene', 'rev_tf_interacts', 'protein'): layer_type(**params, in_channels=(-1,-1)),
+            ('protein', 'rev_associated', 'gene'): layer_type(**params, in_channels=(-1,-1)),
+            ('gene', 'associated', 'protein'): layer_type(**params, in_channels=(-1,-1)),
+            ('protein', 'is_named', 'protein_name'): layer_type(**params, in_channels=(-1,-1)),
+            ('protein_name', 'rev_is_named', 'protein'): layer_type(**params, in_channels=(-1,-1)),
+            ('enhancer','overlaps','atac_region'): layer_type(**params, in_channels=(-1,-1)),
+            ('atac_region','rev_overlaps','enhancer'): layer_type(**params, in_channels=(-1,-1)),
+            ('enhancer','associated','gene'): layer_type(**params, in_channels=(-1,-1)),
+            ('gene','rev_associated','enhancer'): layer_type(**params, in_channels=(-1,-1)),
+            ('atac_region','neighbors','gene'): layer_type(**params, in_channels=(-1,-1)),
+            ('gene','rev_neighbors','atac_region'): layer_type(**params, in_channels=(-1,-1)),
         }
-        self.self_linear = {
-            'protein': Linear(params['out_channels'], params['out_channels']).to(device),
-            'protein_name': Linear(params['out_channels'], params['out_channels']).to(device),
-            'tad': Linear(params['out_channels'], params['out_channels']).to(device),
-            'atac_region': Linear(params['out_channels'], params['out_channels']).to(device),
-            'gene': Linear(params['out_channels'], params['out_channels']).to(device),
-            'enhancer': Linear(params['out_channels'], params['out_channels']).to(device),
-        }
+        #self.self_linear = {
+        #    'protein': Linear(params['out_channels'], params['out_channels']),
+        #    'protein_name': Linear(params['out_channels'], params['out_channels']),
+        #    'tad': Linear(params['out_channels'], params['out_channels']),
+        #    'atac_region': Linear(params['out_channels'], params['out_channels']),
+        #    'gene': Linear(params['out_channels'], params['out_channels']),
+        #    'enhancer': Linear(params['out_channels'], params['out_channels']),
+        #}
 
         # TODO input dimensionality needs to be a parameter or inferred from data
         # TODO it's hardcoded right now to be +1 of the conv output dimensionality, which is likely to break
         # TODO don't need to change out_channels, that should be the same as the input to the convs
         self.input_linear = {
-            'protein_name': Linear(129, params['out_channels']).to(device),
-            'atac_region': Linear(257, params['out_channels']).to(device),
-            'gene': Linear(129, params['out_channels']).to(device),
+            'protein_name': Linear(129, params['out_channels']),
+            'atac_region': Linear(257, params['out_channels']),
+            'gene': Linear(129, params['out_channels']),
         }
 
-        self.protein_zero  = MLP(**out_mlp) 
-        self.protein_value = MLP(**out_mlp)
+        self.protein_dropout  = MLP(out_mlp)
+        self.protein_value = MLP(out_mlp)
 
-        self.gene_value = MLP(**out_mlp) 
-        self.gene_zero  = MLP(**out_mlp) 
+        self.gene_value = MLP(out_mlp) 
+        self.gene_dropout  = MLP(out_mlp) 
 
-        self.atac_zero = MLP(**out_mlp) 
+        self.atac_dropout = MLP(out_mlp) 
 
-    def encode(self, x_dict, layers, source):
-        new_x = {k:v.detach().clone() for k,v in x_dict.items()}
-        for data_type, linear in self.input_linear.items():
-            new_x[data_type] = linear(new_x[data_type])
-            
+    def to(self, device):
+        for k,conv in self.convs.items():
+            self.convs[k] = conv.to(device)
+        for k,layer in self.input_linear.items():
+            self.input_linear[k] = layer.to(device)
+        self.protein_dropout = self.protein_dropout.to(device)
+        self.protein_value = self.protein_value.to(device)
+        self.gene_value = self.gene_value.to(device)
+        self.gene_dropout = self.gene_dropout.to(device)
+        self.atac_dropout = self.atac_dropout.to(device)
+
+    def encode(self, layers):
         for layer in layers:
+            for data_type, data in layer.x_dict.items():
+                if data_type in self.input_linear:
+                    layer[data_type].x = self.input_linear[data_type](layer[data_type].x)
+            
+        layer_idx = 0
+        while layer_idx < len(layers)-1:
+            layer = layers[layer_idx]
             subconv = HeteroConv({relation: conv for relation,conv in self.convs.items()
-                                    if relation in layer._edge_store_dict})
+                                  if relation in layer._edge_store_dict})
 
-            new_x = subconv(new_x, layer.edge_index_dict)
+            new_x = subconv(layer.x_dict, layer.edge_index_dict)
+            next_layer = layers[layer_idx+1]
+            for relation in layer._edge_store_dict:
+                src,_,dst = relation
+                dst_mask = (layer[dst].x_map.unsqueeze(0).T == next_layer[dst].x_map).sum(dim=0).bool()
+                src_mask = (next_layer[dst].x_map.unsqueeze(0).T == layer[dst].x_map).sum(dim=0).bool()
+                next_layer[dst].x[dst_mask] = new_x[dst][src_mask]
+            layer_idx+=1
 
-            for dst in x_dict:
-                # if transformed by subconv, then also add self loops
-                if dst in new_x:
-                    mask = layer[dst].targets
-                    # TODO this breaks our dimensionality, can't use x_dict
-                    self_looped = x_dict[dst].detach().clone()
-                    self_looped[mask] = self.self_linear[dst](self_looped[mask])
-                    new_x[dst] = self_looped + new_x[dst]
-                    new_x[dst][mask] = new_x[dst][mask].relu()
-                # just copy from old x
-                else:
-                    new_x[dst] = x_dict[dst].detach().clone()
+        layer = layers[-1]
+        subconv = HeteroConv({relation: conv for relation,conv in self.convs.items()
+                              if relation in layer._edge_store_dict})
+
+        new_x = subconv(layer.x_dict, layer.edge_index_dict)
+
         return new_x
 
     def gene(self, x_dict):
-        x_dict['p_zero'] = self.sigmoid(self.gene_zero(x_dict['gene']))
-        x_dict['zeros'] = Bernoulli(x_dict['p_zero']).sample()
-        x_dict['values'] = self.gene_value(x_dict['gene'])
-        return x_dict
+        out = dict()
+        out['p_dropout'] = self.sigmoid(self.gene_dropout(x_dict['gene']))
+        out['dropouts'] = Bernoulli(out['p_dropout']).sample()
+        out['values'] = self.gene_value(x_dict['gene'])
+        return out
 
     def atac(self, x_dict):
-        x_dict['p_zero'] = self.sigmoid(self.atac_zero(x_dict['atac_region']))
-        return x_dict
+        out = dict()
+        out['p_dropout'] = self.sigmoid(self.atac_dropout(x_dict['atac_region']))
+        return out
 
     def protein_name(self, x_dict):
-        x_dict['p_zero'] = self.sigmoid(self.protein_zero(x_dict['protein_name']))
-        x_dict['zeros'] = Bernoulli(x_dict['p_zero']).sample()
-        x_dict['values'] = self.protein_value(x_dict['protein_name'])
-        return x_dict
+        out = dict()
+        out['p_dropout'] = self.sigmoid(self.protein_dropout(x_dict['protein_name']))
+        out['dropouts'] = Bernoulli(out['p_dropout']).sample()
+        out['values'] = self.protein_value(x_dict['protein_name'])
+        return out
     
-    def forward(self, x_dict, layers, task):
+    def forward(self, layers, task):
         source, target = task
-        x_dict = self.encode(x_dict, layers, source)
+        x_dict = self.encode(layers)
         if target == 'gene':
-            x = self.gene(x_dict, edge_index_dict)
+            x = self.gene(x_dict)
         if target == 'protein_name':
-            x = self.protein_name(x_dict, edge_index_dict)
+            x = self.protein_name(x_dict)
         if target == 'atac_region':
-            x = self.atac(x_dict, edge_index_dict)
+            x = self.atac(x_dict)
 
         return x
 
@@ -225,8 +250,9 @@ params = {
               ('SAGEConv', {'out_channels':128}),
               ('SAGEConv', {'out_channels':128})],
               #('TransformerConv', {'out_channels':32, 'heads':2})],
-    'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
-               'dim_inner': 512, 'num_layers':3},
+    #'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
+    #           'dim_inner': 512, 'num_layers':3},
+    'out_mlp': [128, 256, 1],
     'train_batch_size': 5,
     'validation_batch_size': 100,
     'checkpoint': 25,
@@ -284,14 +310,9 @@ graph = graph.to('cpu')
 graph = torch_geometric.transforms.ToUndirected()(graph)
 graph = graph.to(device)
 
-def get_mask(graph, task):
-    for i,node_type in enumerate(task):
-        graph[node_type]['mask'] = mask
-    return graph
-
-
 print('Initializing EaRL', file=log)
 earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'], device=device)
+earl.to(device)
 
 optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['lr'])
 earl.train()
@@ -320,7 +341,7 @@ best_validation_loss = float('inf')
 loader = HeteroPathSampler(graph, device)
 n_sample_steps = params['n_sample_steps']
 
-def predict(earl, graph, task, cell_idxs, target_idxs, mask, eval=False):
+def predict(earl, graph, task, cell_idxs, target_idxs, eval=False):
     source,target = task
     with torch.inference_mode(eval):
         predictions = []
@@ -330,13 +351,15 @@ def predict(earl, graph, task, cell_idxs, target_idxs, mask, eval=False):
             # sample a subgraph
             # TODO batching
             for target_idx in target_idxs:
-                subgraph = loader.sample(task, [target_idx], n_steps=n_sample_steps, random_sample=True)
+                subgraph = loader.sample(task, [target_idx], n_steps=n_sample_steps, sampling_factor=1.0)
                 # TODO avoid possible infinite loop?
                 # TODO loosen random sampling?
-                while subgraph[0].num_edges == 0:
-                    subgraph = loader.sample(task, [target_idx], n_steps=n_sample_steps, random_sample=True)
-                output = earl(newgraph.x_dict, subgraph, task)
-                predictions.append((output, graph[target].y))
+                if subgraph[0].num_edges == 0:
+                    print('No subgraph found: ',target_idx, file=log)
+                    continue
+                    #subgraph = loader.sample(task, [target_idx], n_steps=n_sample_steps, random_sample=True)
+                output = earl(subgraph, task)
+                predictions.append((output, graph[target].y[target_idx]))
 
         return predictions
 
@@ -346,28 +369,33 @@ def chunks(lst, n):
         yield lst[i:i + n]
 
 
-def compute_loss(prediction, y, target, mask):
-    y_zero = y > .00001
+def compute_loss(prediction, y, target):
+    y_one = y > .00001
     # TODO normalize loss so that genes/atacs dont swamp protein gradients?
-    p_zeros = prediction['p_zero'][mask]
+    p_dropout = prediction['p_dropout']
     
     if target == 'atac_region':
-        bce_loss = BCELoss(weight=1+y_zero*params['atac_ones_weight'])
-        loss = bce_loss(p_zeros, y_zero.float())
+        bce_loss = BCELoss(weight=1+y_one*params['atac_ones_weight'])
+        loss = bce_loss(p_dropout, y_one.float().view((1,-1)))
         return loss, loss, 0, loss
 
     if target in ['gene', 'protein_name']:
         if target=='gene':
-            bce_loss = BCELoss(weight=1+y_zero*params['gene_ones_weight'])
+            bce_loss = BCELoss(weight=1+y_one*params['gene_ones_weight'])
         else:
             bce_loss = BCELoss()
-        values = prediction['values'][mask]
-        zeros = prediction['zeros'][mask]
-        zero_loss = bce_loss(p_zeros, y_zero.float())
-        value_loss = ((values[y_zero] - y[y_zero])**2).mean()
-        prediction_loss = float(((values*zeros - y)**2).mean())
-        loss = zero_loss + value_loss
-        return loss, prediction_loss, value_loss, zero_loss
+        values = prediction['values']
+        dropouts = prediction['dropouts']
+        # TODO this view shape might be wrong
+        dropout_loss = bce_loss(p_dropout, y_one.float().view((1,-1)))
+        if len(y[y_one]) > 0:
+            value_loss = ((values[y_one] - y[y_one])**2).mean()
+            loss = dropout_loss + value_loss
+        else:
+            value_loss = 0.0
+            loss = dropout_loss
+        prediction_loss = float(((values*dropouts - y)**2).mean())
+        return loss, prediction_loss, value_loss, dropout_loss
 
 tasks = list(train_cell_idxs.keys())
 
@@ -377,29 +405,31 @@ for batch_idx in range(n_steps):
     optimizer.zero_grad()
     for task in tasks:
         cell_batch = random.sample(train_cell_idxs[task], k=train_batch_size)
-        target_batch = random.sample(range(expression[task][1].shape[0]), k=train_batch_size)
+        target_batch = random.sample(range(expression[task][1].shape[1]), k=train_batch_size)
         
         source,target = task
-        mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
-        mask[graph_idxs[task][1][:,1]] = 1
-        batch_zero_loss = 0.0
+        batch_dropout_loss = 0.0
         batch_value_loss = 0.0
         batch_prediction_loss = 0.0
+        batch_len = 0
         for cell_idx in cell_batch:
-            # only one prediction at a time, minimizes memory usage
-            prediction, y = predict(earl, graph, task, cell_idxs=[cell_idx], target_idxs=target_batch, mask=mask)[0]
-            losses = compute_loss(prediction, y[mask], target, mask) 
-            loss, prediction_loss, value_loss, zero_loss = losses
-            loss.backward()
+            predictions = predict(earl, graph, task, cell_idxs=[cell_idx], target_idxs=target_batch)
+            for prediction in predictions:
+                prediction, y = prediction
+                losses = compute_loss(prediction, y, target) 
+                loss, prediction_loss, value_loss, dropout_loss = losses
+                loss.backward()
+                batch_len += 1
 
-            batch_zero_loss += float(zero_loss)/len(batch)
-            batch_value_loss += float(value_loss)/len(batch)
-            batch_prediction_loss += float(prediction_loss)/len(batch)
+                batch_dropout_loss += float(dropout_loss)
+                batch_value_loss += float(value_loss)
+                batch_prediction_loss += float(prediction_loss)
+            print('Number of predictions', len(predictions), file=log)
 
         print(f'Batch={batch_idx}', file=log)
-        print(f'train zero one loss {task}={batch_zero_loss}', file=log) 
-        print(f'train value loss {task}={batch_value_loss}',flush=True, file=log)
-        print(f'train prediction loss {task}={batch_prediction_loss}',flush=True, file=log)
+        print(f'train dropout one loss {task}={batch_dropout_loss/batch_len}', file=log) 
+        print(f'train value loss {task}={batch_value_loss/batch_len}',flush=True, file=log)
+        print(f'train prediction loss {task}={batch_prediction_loss/batch_len}',flush=True, file=log)
     optimizer.step()
 
     # Checkpoint
@@ -413,34 +443,30 @@ for batch_idx in range(n_steps):
             source,target = task
             total_validation_loss = 0.0
 
-            mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
-            mask[graph_idxs[task][1][:,1]] = 1
-
             idxs = random.sample(validation_cell_idxs[task], k=validation_batch_size)
             validation_loss = 0.0
-            zero_loss = 0.0
+            dropout_loss = 0.0
             value_loss = 0.0
             for idx in idxs:
-                prediction, y = predict(earl, graph, task, [idx], mask, eval=True)[0]
-                y = y[mask].flatten()
-                losses = compute_loss(prediction, y, target, mask) 
-                _, _validation_loss, _value_loss, _zero_loss = losses
-                zero_loss += _zero_loss/len(idxs)
+                prediction, y = predict(earl, graph, task, [idx], eval=True)[0]
+                losses = compute_loss(prediction, y, target) 
+                _, _validation_loss, _value_loss, _dropout_loss = losses
+                dropout_loss += _dropout_loss/len(idxs)
                 value_loss += _value_loss/len(idxs)
                 validation_loss += _validation_loss/len(idxs)
-            print(f'validation zero one loss {task}={float(zero_loss)}', file=log) 
+            print(f'validation dropout one loss {task}={float(dropout_loss)}', file=log) 
             print(f'validation value loss {task}={float(value_loss)}',flush=True, file=log)
             print(f'validation prediction loss {task}={validation_loss}',flush=True, file=log)
             total_validation_loss += validation_loss
 
             if target == 'atac_region':
-                p_zeros = prediction['p_zero'][mask]
-                stacked = torch.vstack([p_zeros, y])
+                p_dropout = prediction['p_dropout']
+                stacked = torch.vstack([p_dropout, y])
 
             if target in ['gene', 'protein_name']:
-                zeros = prediction['zeros'][mask]
-                values = prediction['values'][mask]
-                stacked = torch.vstack([values*zeros, y])
+                dropouts = prediction['dropouts']
+                values = prediction['values']
+                stacked = torch.vstack([values*dropouts, y])
 
             print('-'*80, file=prediction_log)
             print(f'Task: {task}', file=prediction_log)

@@ -92,58 +92,47 @@ def add_expression(graph, cell_idx, task):
     
 
 class EaRL(torch.nn.Module):
-    def __init__(self, gnn_layers, out_mlp, device):
+    def __init__(self, gnn_params, out_mlp, device):
         super().__init__()
 
-        #self.convs = torch.nn.ModuleList()
         self.sigmoid = Sigmoid()
         # This is a little shim that gets around us not being able to json dump 
         # the class of the layer (i.e GATConv) in the param dictionary
-        layer_classes = {'GATConv':GATConv, 'SAGEConv':SAGEConv,
+        conv_classes = {'GATConv':GATConv, 'SAGEConv':SAGEConv,
                          'TransformerConv':TransformerConv}
 
-        #for layer_type, params in gnn_layers:
-        #layer_type = layer_classes[layer_type]
-        _, params = gnn_layers[0]
-        layer_type = SAGEConv
+        conv_name, conv_params = gnn_params
+        conv = conv_classes[conv_name]
         self.convs = {
-            ('tad', 'overlaps', 'atac_region'): layer_type(**params, in_channels=(-1,-1)),
-            ('atac_region', 'rev_overlaps', 'tad'): layer_type(**params, in_channels=(-1,-1)),
-            ('tad', 'overlaps', 'gene'): layer_type(**params, in_channels=(-1,-1)),
-            ('gene', 'rev_overlaps', 'tad'): layer_type(**params, in_channels=(-1,-1)),
-            ('atac_region', 'overlaps', 'gene'): layer_type(**params, in_channels=(-1,-1)),
-            ('gene', 'rev_overlaps', 'atac_region'): layer_type(**params, in_channels=(-1,-1)),
+            ('tad', 'overlaps', 'atac_region'): conv(**conv_params, in_channels=(-1,-1)),
+            ('atac_region', 'rev_overlaps', 'tad'): conv(**conv_params, in_channels=(-1,-1)),
+            ('tad', 'overlaps', 'gene'): conv(**conv_params, in_channels=(-1,-1)),
+            ('gene', 'rev_overlaps', 'tad'): conv(**conv_params, in_channels=(-1,-1)),
+            ('atac_region', 'overlaps', 'gene'): conv(**conv_params, in_channels=(-1,-1)),
+            ('gene', 'rev_overlaps', 'atac_region'): conv(**conv_params, in_channels=(-1,-1)),
             # Not bipartite so we have just (-1) for in channels, same feature sizes for both
-            ('protein', 'coexpressed', 'protein'): layer_type(**params, in_channels=-1),
-            ('protein', 'tf_interacts', 'gene'): layer_type(**params, in_channels=(-1,-1)),
-            ('gene', 'rev_tf_interacts', 'protein'): layer_type(**params, in_channels=(-1,-1)),
-            ('protein', 'rev_associated', 'gene'): layer_type(**params, in_channels=(-1,-1)),
-            ('gene', 'associated', 'protein'): layer_type(**params, in_channels=(-1,-1)),
-            ('protein', 'is_named', 'protein_name'): layer_type(**params, in_channels=(-1,-1)),
-            ('protein_name', 'rev_is_named', 'protein'): layer_type(**params, in_channels=(-1,-1)),
-            ('enhancer','overlaps','atac_region'): layer_type(**params, in_channels=(-1,-1)),
-            ('atac_region','rev_overlaps','enhancer'): layer_type(**params, in_channels=(-1,-1)),
-            ('enhancer','associated','gene'): layer_type(**params, in_channels=(-1,-1)),
-            ('gene','rev_associated','enhancer'): layer_type(**params, in_channels=(-1,-1)),
-            ('atac_region','neighbors','gene'): layer_type(**params, in_channels=(-1,-1)),
-            ('gene','rev_neighbors','atac_region'): layer_type(**params, in_channels=(-1,-1)),
+            ('protein', 'coexpressed', 'protein'): conv(**conv_params, in_channels=-1),
+            ('protein', 'tf_interacts', 'gene'): conv(**conv_params, in_channels=(-1,-1)),
+            ('gene', 'rev_tf_interacts', 'protein'): conv(**conv_params, in_channels=(-1,-1)),
+            ('protein', 'rev_associated', 'gene'): conv(**conv_params, in_channels=(-1,-1)),
+            ('gene', 'associated', 'protein'): conv(**conv_params, in_channels=(-1,-1)),
+            ('protein', 'is_named', 'protein_name'): conv(**conv_params, in_channels=(-1,-1)),
+            ('protein_name', 'rev_is_named', 'protein'): conv(**conv_params, in_channels=(-1,-1)),
+            ('enhancer','overlaps','atac_region'): conv(**conv_params, in_channels=(-1,-1)),
+            ('atac_region','rev_overlaps','enhancer'): conv(**conv_params, in_channels=(-1,-1)),
+            ('enhancer','associated','gene'): conv(**conv_params, in_channels=(-1,-1)),
+            ('gene','rev_associated','enhancer'): conv(**conv_params, in_channels=(-1,-1)),
+            ('atac_region','neighbors','gene'): conv(**conv_params, in_channels=(-1,-1)),
+            ('gene','rev_neighbors','atac_region'): conv(**conv_params, in_channels=(-1,-1)),
         }
-        #self.self_linear = {
-        #    'protein': Linear(params['out_channels'], params['out_channels']),
-        #    'protein_name': Linear(params['out_channels'], params['out_channels']),
-        #    'tad': Linear(params['out_channels'], params['out_channels']),
-        #    'atac_region': Linear(params['out_channels'], params['out_channels']),
-        #    'gene': Linear(params['out_channels'], params['out_channels']),
-        #    'enhancer': Linear(params['out_channels'], params['out_channels']),
-        #}
 
         # TODO input dimensionality needs to be a parameter or inferred from data
         # TODO it's hardcoded right now to be +1 of the conv output dimensionality, which is likely to break
         # TODO don't need to change out_channels, that should be the same as the input to the convs
         self.input_linear = {
-            'protein_name': Linear(129, params['out_channels']),
-            'atac_region': Linear(257, params['out_channels']),
-            'gene': Linear(129, params['out_channels']),
+            'protein_name': Linear(129, conv_params['out_channels']),
+            'atac_region': Linear(257, conv_params['out_channels']),
+            'gene': Linear(129, conv_params['out_channels']),
         }
 
         self.protein_dropout  = MLP(out_mlp)
@@ -244,17 +233,10 @@ print(now, file=log)
 params = {
     'lr':.001,
     'n_steps':15000,
-    'layers':[('SAGEConv', {'out_channels':128, 'root_weight':False, 'bias':False, 'normalize':False}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128})],
-              #('TransformerConv', {'out_channels':32, 'heads':2})],
-    #'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
-    #           'dim_inner': 512, 'num_layers':3},
+    'gnn_params':('TransformerConv', {'out_channels':128, 'heads':1}),
     'out_mlp': [128, 256, 1],
     'train_batch_size': 5,
-    'validation_batch_size': 100,
+    'validation_batch_size': 10,
     'checkpoint': 25,
     'atac_ones_weight': 1,
     'gene_ones_weight': 1,
@@ -311,7 +293,7 @@ graph = torch_geometric.transforms.ToUndirected()(graph)
 graph = graph.to(device)
 
 print('Initializing EaRL', file=log)
-earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'], device=device)
+earl = EaRL(gnn_params=params['gnn_params'], out_mlp=params['out_mlp'], device=device)
 earl.to(device)
 
 optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['lr'])
@@ -443,20 +425,29 @@ for batch_idx in range(n_steps):
             source,target = task
             total_validation_loss = 0.0
 
-            idxs = random.sample(validation_cell_idxs[task], k=validation_batch_size)
+            cell_idxs = random.sample(validation_cell_idxs[task], k=validation_batch_size)
+            target_batch = random.sample(range(expression[task][1].shape[1]), k=train_batch_size)
             validation_loss = 0.0
-            dropout_loss = 0.0
-            value_loss = 0.0
-            for idx in idxs:
-                prediction, y = predict(earl, graph, task, [idx], eval=True)[0]
-                losses = compute_loss(prediction, y, target) 
-                _, _validation_loss, _value_loss, _dropout_loss = losses
-                dropout_loss += _dropout_loss/len(idxs)
-                value_loss += _value_loss/len(idxs)
-                validation_loss += _validation_loss/len(idxs)
-            print(f'validation dropout one loss {task}={float(dropout_loss)}', file=log) 
-            print(f'validation value loss {task}={float(value_loss)}',flush=True, file=log)
-            print(f'validation prediction loss {task}={validation_loss}',flush=True, file=log)
+            val_dropout_loss = 0.0
+            val_prediction_loss = 0.0
+            val_value_loss = 0.0
+            for cell_idx in cell_batch:
+                predictions = predict(earl, graph, task, cell_idxs=[cell_idx], target_idxs=target_batch)
+                for prediction in predictions:
+                    prediction, y = prediction
+                    losses = compute_loss(prediction, y, target) 
+                    loss, prediction_loss, value_loss, dropout_loss = losses
+                    batch_len += 1
+
+                    val_dropout_loss += float(dropout_loss)
+                    val_value_loss += float(value_loss)
+                    val_prediction_loss += float(prediction_loss)
+                    validation_loss += float(loss)
+            print('Number of predictions', len(predictions), file=log)
+            print(f'Batch={batch_idx}', file=log)
+            print(f'validation dropout one loss {task}={val_dropout_loss/batch_len}', file=log) 
+            print(f'validation value loss {task}={val_value_loss/batch_len}',flush=True, file=log)
+            print(f'validation prediction loss {task}={val_prediction_loss/batch_len}',flush=True, file=log)
             total_validation_loss += validation_loss
 
             if target == 'atac_region':
@@ -477,6 +468,8 @@ for batch_idx in range(n_steps):
                       file=prediction_log, flush=True)
 
         torch.save(earl.state_dict(), f'models/latest_earl_{now}.model')
+        print('total_validation_loss={total_validation_loss}',file=log)
+        print('best_validation_loss={best_validation_loss}',file=log)
         if total_validation_loss < best_validation_loss and log:
             torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
             best_validation_loss = total_validation_loss

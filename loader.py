@@ -35,11 +35,12 @@ class HeteroPathSampler():
 
                         if next_source == source:
                             edge_index = edges.edge_index
-                            for idx in next_ids:
-                                if idx not in visited[relation]:
-                                    visited[relation].add(idx)
-                                    match_mask = (edge_index[0]==idx).flatten()
-                                    self.update_mask(edge_masks, relation, match_mask)
+                            #TODO batching ids 
+                            for idxs in next_ids.split(10):
+                                #if idx not in visited[relation]:
+                                #visited[relation].add(idx)
+                                match_mask = (edge_index[0]==idxs.unsqueeze(0).T).sum(axis=0).bool()
+                                self.update_mask(edge_masks, relation, match_mask)
 
                 new_graph = HeteroData()
                 for relation in edge_masks:
@@ -47,7 +48,7 @@ class HeteroPathSampler():
                     if sampling_factor:
                         true_idxs = torch.arange(0,len(mask), device=self.device, dtype=int)
                         true_idxs = true_idxs[mask]
-                        n_samples = ceil(sqrt(len(true_idxs)**sampling_factor))
+                        n_samples = ceil(sampling_factor**log(len(true_idxs), 2))
                         sample_idxs = torch.randperm(len(true_idxs), device=self.device)[:n_samples]
                         mask = torch.zeros(mask.shape, device=self.device, dtype=bool)
                         mask[true_idxs[sample_idxs]] = True
@@ -101,6 +102,7 @@ class HeteroPathSampler():
                 all_nodes = {}
                 
                 for node_type in srcs:
+                    # NOTE not sure what the unique is doing but don't remove it
                     self.append_ids(all_nodes, node_type, srcs[node_type].unique())
 
                 for node_type in sources:

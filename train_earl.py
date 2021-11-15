@@ -8,6 +8,7 @@ from collections import defaultdict
 import pickle
 import random
 from collections import Counter
+from statistics import mean
 
 import scanpy
 import numpy as np
@@ -33,6 +34,9 @@ def MLP(channels):
     final = Linear(channels[len(channels)-2], channels[len(channels)-1])
     return Seq(hidden, final)
 
+# protein_idxs is a (n_proteins x 2) 
+# The first column is an index to the data
+# the second index is an index to the graph
 def proteins_to_idxs(data):
     indexes = []
     proteins = data.var.index.to_list()
@@ -79,6 +83,9 @@ def add_expression(graph, cell_idx, task):
         src_idxs = graph_idxs[task][0]
         tgt_idxs = graph_idxs[task][1]
 
+        # src_idxs[:,1] is the index of the nodes in the graph corresponding to the data
+        # src_idxs[:,0] is the index of the source data
+        # same for target
         graph[source].x[src_idxs[:,1],-1] = src_expr[0,src_idxs[:,0]]
 
         graph[target].y = torch.ones((len(node_idxs[target]),1), device=device)*-1
@@ -92,7 +99,7 @@ def add_expression(graph, cell_idx, task):
     
 
 class EaRL(torch.nn.Module):
-    def __init__(self, gnn_params, out_mlp, device):
+    def __init__(self, gnn_params, out_mlp, layer_mlp):
         super().__init__()
 
         self.sigmoid = Sigmoid()
@@ -143,6 +150,9 @@ class EaRL(torch.nn.Module):
 
         self.atac_dropout = MLP(out_mlp) 
 
+        self.node_types = ['atac_region', 'gene', 'tad', 'protein', 'protein_name', 'enhancer']
+        self.mlp = {node_type:MLP(layer_mlp) for node_type in self.node_types} 
+
     def to(self, device):
         for k,conv in self.convs.items():
             self.convs[k] = conv.to(device)
@@ -153,6 +163,8 @@ class EaRL(torch.nn.Module):
         self.gene_value = self.gene_value.to(device)
         self.gene_dropout = self.gene_dropout.to(device)
         self.atac_dropout = self.atac_dropout.to(device)
+        for task, mlp in self.mlp.items():
+            self.mlp[task] = mlp.to(device)
 
     def encode(self, layers):
         for layer in layers:
@@ -167,6 +179,9 @@ class EaRL(torch.nn.Module):
                                   if relation in layer._edge_store_dict})
 
             new_x = subconv(layer.x_dict, layer.edge_index_dict)
+            
+            new_x = {dst: self.mlp[dst](x) for dst,x in new_x.items()}
+
             next_layer = layers[layer_idx+1]
             for relation in layer._edge_store_dict:
                 src,_,dst = relation
@@ -181,7 +196,7 @@ class EaRL(torch.nn.Module):
 
         new_x = subconv(layer.x_dict, layer.edge_index_dict)
 
-        return new_x
+        return new_x, layer[target].x_map
 
     def gene(self, x_dict):
         out = dict()
@@ -204,7 +219,7 @@ class EaRL(torch.nn.Module):
     
     def forward(self, layers, task):
         source, target = task
-        x_dict = self.encode(layers)
+        x_dict, x_map = self.encode(layers)
         if target == 'gene':
             x = self.gene(x_dict)
         if target == 'protein_name':
@@ -212,7 +227,7 @@ class EaRL(torch.nn.Module):
         if target == 'atac_region':
             x = self.atac(x_dict)
 
-        return x
+        return x, x_map
 
 
 now = datetime.strftime(datetime.now(), format='%Y%m%d-%H%M')
@@ -233,14 +248,16 @@ print(now, file=log)
 params = {
     'lr':.001,
     'n_steps':15000,
-    'gnn_params':('TransformerConv', {'out_channels':128, 'heads':1}),
-    'out_mlp': [128, 256, 1],
-    'train_batch_size': 5,
-    'validation_batch_size': 10,
+    'gnn_params':('TransformerConv', {'out_channels':128, 'heads':3}),
+    'out_mlp': [128*3, 256, 1],
+    'layer_mlp': [128*3, 256, 128],
     'checkpoint': 25,
     'atac_ones_weight': 1,
     'gene_ones_weight': 1,
-    'n_sample_steps': 5,
+    'sample_depth': [3,4,5,6],
+    'sampling_factors': [1.4, 1.5, 1.6],
+    'cells_per_batch': 50,
+    'targets_per_sample': 1000,
     'device': device,
 }
 
@@ -293,7 +310,10 @@ graph = torch_geometric.transforms.ToUndirected()(graph)
 graph = graph.to(device)
 
 print('Initializing EaRL', file=log)
-earl = EaRL(gnn_params=params['gnn_params'], out_mlp=params['out_mlp'], device=device)
+earl = EaRL(gnn_params=params['gnn_params'], 
+            out_mlp=params['out_mlp'],
+            layer_mlp=params['layer_mlp'])
+
 earl.to(device)
 
 optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['lr'])
@@ -313,15 +333,12 @@ for task in expression:
     train_cell_idxs[task] = cell_idxs[:train_set_size]
     validation_cell_idxs[task] = cell_idxs[train_set_size:]
 
-train_batch_size = params['train_batch_size']
-validation_batch_size = params['validation_batch_size']
 
 bce_loss = BCELoss()
 
 best_validation_loss = float('inf')
 
 loader = HeteroPathSampler(graph, device)
-n_sample_steps = params['n_sample_steps']
 
 def predict(earl, graph, task, cell_idxs, target_idxs, eval=False):
     source,target = task
@@ -331,17 +348,22 @@ def predict(earl, graph, task, cell_idxs, target_idxs, eval=False):
         for cell_idx in cell_idxs:
             newgraph = add_expression(graph, cell_idx, task)
             # sample a subgraph
-            # TODO batching
-            for target_idx in target_idxs:
-                subgraph = loader.sample(task, [target_idx], n_steps=n_sample_steps, sampling_factor=1.0)
-                # TODO avoid possible infinite loop?
-                # TODO loosen random sampling?
-                if subgraph[0].num_edges == 0:
-                    print('No subgraph found: ',target_idx, file=log)
-                    continue
-                    #subgraph = loader.sample(task, [target_idx], n_steps=n_sample_steps, random_sample=True)
-                output = earl(subgraph, task)
-                predictions.append((output, graph[target].y[target_idx]))
+            sample_depth = random.choice(params['sample_depth'])
+            sampling_factor = random.choice(params['sampling_factors'])
+            #print(f'sample_depth={sample_depth}', file=log)
+            #print(f'sampling_factor={sampling_factor}', file=log)
+            subgraph = loader.sample(task, 
+                                     target_idxs, 
+                                     n_steps=sample_depth, 
+                                     sampling_factor=sampling_factor)
+            if subgraph[0].num_edges == 0:
+                print(f'Empty graph={cell_idx}')
+                continue
+            if task[1] in subgraph[-1].x_map_dict:
+                print(f'N targets predicted={len(subgraph[-1][task[1]].x_map.unique())}', file=log)
+
+            output, x_map = earl(subgraph, task)
+            predictions.append((output, graph[target].y[x_map], x_map))
 
         return predictions
 
@@ -358,7 +380,7 @@ def compute_loss(prediction, y, target):
     
     if target == 'atac_region':
         bce_loss = BCELoss(weight=1+y_one*params['atac_ones_weight'])
-        loss = bce_loss(p_dropout, y_one.float().view((1,-1)))
+        loss = bce_loss(p_dropout, y_one.float())
         return loss, loss, 0, loss
 
     if target in ['gene', 'protein_name']:
@@ -368,8 +390,7 @@ def compute_loss(prediction, y, target):
             bce_loss = BCELoss()
         values = prediction['values']
         dropouts = prediction['dropouts']
-        # TODO this view shape might be wrong
-        dropout_loss = bce_loss(p_dropout, y_one.float().view((1,-1)))
+        dropout_loss = bce_loss(p_dropout, y_one.float()).mean()
         if len(y[y_one]) > 0:
             value_loss = ((values[y_one] - y[y_one])**2).mean()
             loss = dropout_loss + value_loss
@@ -386,32 +407,32 @@ for batch_idx in range(n_steps):
     #task = random.choice(tasks)
     optimizer.zero_grad()
     for task in tasks:
-        cell_batch = random.sample(train_cell_idxs[task], k=train_batch_size)
-        target_batch = random.sample(range(expression[task][1].shape[1]), k=train_batch_size)
+        cell_batch = random.sample(train_cell_idxs[task], k=params['cells_per_batch'])
+        # grabs a sample of the indexes of the nodes that have data
+        n_max = len(graph_idxs[task][1])
+        n = min(params['targets_per_sample'], n_max)
+        rnd = torch.randint(len(graph_idxs[task][1]), (n,))
+        target_batch = graph_idxs[task][1][rnd,1]
         
         source,target = task
-        batch_dropout_loss = 0.0
-        batch_value_loss = 0.0
-        batch_prediction_loss = 0.0
-        batch_len = 0
-        for cell_idx in cell_batch:
-            predictions = predict(earl, graph, task, cell_idxs=[cell_idx], target_idxs=target_batch)
-            for prediction in predictions:
-                prediction, y = prediction
-                losses = compute_loss(prediction, y, target) 
-                loss, prediction_loss, value_loss, dropout_loss = losses
-                loss.backward()
-                batch_len += 1
+        batch_dropout_loss = []
+        batch_value_loss = []
+        batch_prediction_loss = []
+        predictions = predict(earl, graph, task, cell_idxs=cell_batch, target_idxs=target_batch)
+        for prediction in predictions:
+            prediction, y, prediction_idxs = prediction
+            losses = compute_loss(prediction, y, target) 
+            loss, prediction_loss, value_loss, dropout_loss = losses
+            loss.backward()
 
-                batch_dropout_loss += float(dropout_loss)
-                batch_value_loss += float(value_loss)
-                batch_prediction_loss += float(prediction_loss)
-            print('Number of predictions', len(predictions), file=log)
+            batch_dropout_loss.append(float(dropout_loss))
+            batch_value_loss.append(float(value_loss))
+            batch_prediction_loss.append(float(prediction_loss))
 
         print(f'Batch={batch_idx}', file=log)
-        print(f'train dropout one loss {task}={batch_dropout_loss/batch_len}', file=log) 
-        print(f'train value loss {task}={batch_value_loss/batch_len}',flush=True, file=log)
-        print(f'train prediction loss {task}={batch_prediction_loss/batch_len}',flush=True, file=log)
+        print(f'train dropout one loss {task}={mean(batch_dropout_loss)}', file=log) 
+        print(f'train value loss {task}={mean(batch_value_loss)}',flush=True, file=log)
+        print(f'train prediction loss {task}={mean(batch_prediction_loss)}',flush=True, file=log)
     optimizer.step()
 
     # Checkpoint
@@ -425,51 +446,60 @@ for batch_idx in range(n_steps):
             source,target = task
             total_validation_loss = 0.0
 
-            cell_idxs = random.sample(validation_cell_idxs[task], k=validation_batch_size)
-            target_batch = random.sample(range(expression[task][1].shape[1]), k=train_batch_size)
-            validation_loss = 0.0
-            val_dropout_loss = 0.0
-            val_prediction_loss = 0.0
-            val_value_loss = 0.0
-            for cell_idx in cell_batch:
-                predictions = predict(earl, graph, task, cell_idxs=[cell_idx], target_idxs=target_batch)
-                for prediction in predictions:
-                    prediction, y = prediction
-                    losses = compute_loss(prediction, y, target) 
-                    loss, prediction_loss, value_loss, dropout_loss = losses
-                    batch_len += 1
+            cell_batch = random.sample(validation_cell_idxs[task], k=params['cells_per_batch'])
+            rnd = torch.randint(len(graph_idxs[task][1]), (params['targets_per_sample'],))
+            target_batch = graph_idxs[task][1][rnd,1]
 
-                    val_dropout_loss += float(dropout_loss)
-                    val_value_loss += float(value_loss)
-                    val_prediction_loss += float(prediction_loss)
-                    validation_loss += float(loss)
-            print('Number of predictions', len(predictions), file=log)
+            validation_loss = []
+            val_dropout_loss = []
+            val_prediction_loss = []
+            val_value_loss = []
+            predictions = predict(earl, graph, task, cell_idxs=cell_batch, target_idxs=target_batch)
+            print('-'*80, file=prediction_log)
+            print(f'Task: {task}', file=prediction_log)
+            print('-'*80, file=prediction_log)
+            for prediction in predictions:
+                prediction, y, prediction_idxs = prediction
+                losses = compute_loss(prediction, y, target) 
+                loss, prediction_loss, value_loss, dropout_loss = losses
+
+                val_dropout_loss.append(float(dropout_loss))
+                val_value_loss.append(float(value_loss))
+                val_prediction_loss.append(float(prediction_loss))
+                validation_loss.append(float(loss))
+
             print(f'Batch={batch_idx}', file=log)
-            print(f'validation dropout one loss {task}={val_dropout_loss/batch_len}', file=log) 
-            print(f'validation value loss {task}={val_value_loss/batch_len}',flush=True, file=log)
-            print(f'validation prediction loss {task}={val_prediction_loss/batch_len}',flush=True, file=log)
-            total_validation_loss += validation_loss
-
+            print(f'validation dropout one loss {task}={mean(val_dropout_loss)}', file=log) 
+            print(f'validation value loss {task}={mean(val_value_loss)}',flush=True, file=log)
+            print(f'validation prediction loss {task}={mean(val_prediction_loss)}',flush=True, file=log)
             if target == 'atac_region':
                 p_dropout = prediction['p_dropout']
-                stacked = torch.vstack([p_dropout, y])
+                #dropouts = prediction['dropouts']
+                stacked = torch.hstack([p_dropout, y])
+                for i in range(min(stacked.shape[0], 100)):
+                    print(f'batch {batch_idx} {i:<6d} pred,y: '+
+                          f'{float(stacked[i,0]):>7.3f} {float(stacked[i,1]):.0f}', 
+                          file=prediction_log)
+                print('', flush=True)
 
             if target in ['gene', 'protein_name']:
                 dropouts = prediction['dropouts']
                 values = prediction['values']
-                stacked = torch.vstack([values*dropouts, y])
+                stacked = torch.hstack([values*dropouts, y])
 
-            print('-'*80, file=prediction_log)
-            print(f'Task: {task}', file=prediction_log)
-            print('-'*80, file=prediction_log)
-            for i in range(min(stacked.shape[1], 300)):
-                print(f'batch {batch_idx} {i:<6d} pred,y: '+
-                      f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
-                      file=prediction_log, flush=True)
+                for i in range(min(stacked.shape[0], 100)):
+                    print(f'batch {batch_idx} {i:<6d} pred,y: '+
+                          f'{float(stacked[i,0]):>7.3f} {float(stacked[i,1]):.3f}', 
+                          file=prediction_log)
+                print('', flush=True)
 
-        torch.save(earl.state_dict(), f'models/latest_earl_{now}.model')
-        print('total_validation_loss={total_validation_loss}',file=log)
-        print('best_validation_loss={best_validation_loss}',file=log)
+            total_validation_loss += mean(validation_loss)
+
+
+        if log:
+            torch.save(earl.state_dict(), f'models/latest_earl_{now}.model')
+        print(f'total_validation_loss={total_validation_loss}',file=log)
+        print(f'best_validation_loss={best_validation_loss}',file=log)
         if total_validation_loss < best_validation_loss and log:
             torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
             best_validation_loss = total_validation_loss

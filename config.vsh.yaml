@@ -1,6 +1,6 @@
 functionality:
   name: python_starter_kit
-  namespace: predict_modality_starter_kits
+  namespace: match_modality_starter_kits
   
   # metadata for your method
   version: dev
@@ -16,35 +16,49 @@ functionality:
     # required inputs
     - name: "--input_train_mod1"
       type: "file"
-      example: "dataset_mod1.h5ad"
-      description: Censored dataset, training cells.
-      required: true
-    - name: "--input_test_mod1"
-      type: "file"
-      example: "dataset_mod1.h5ad"
-      description: Censored dataset, test cells.
+      example: "dataset_censored.h5ad"
+      description: "The censored shuffled train mod1 profiles."
       required: true
     - name: "--input_train_mod2"
       type: "file"
-      example: "dataset_mod2.h5ad"
-      description: Censored dataset.
+      example: "dataset_censored.h5ad"
+      description: "The censored shuffled train mod2 profiles."
+      required: true
+    - name: "--input_train_sol"
+      type: "file"
+      example: "dataset_solution.h5ad"
+      description: "The pairing of train mod1&mod2 profiles."
+      required: true
+    - name: "--input_test_mod1"
+      type: "file"
+      example: "dataset_censored.h5ad"
+      description: "The censored shuffled test mod1 profiles."
+      required: true
+    - name: "--input_test_mod2"
+      type: "file"
+      example: "dataset_censored.h5ad"
+      description: "The censored shuffled test mod2 profiles."
       required: true
     # required outputs
     - name: "--output"
       type: "file"
       direction: "output"
       example: "output.h5ad"
-      description: Dataset with predicted values for modality2.
+      description: "The predicted pairing of test mod1&mod2 profiles."
       required: true
-    # additional parameters
+    # Method-specific parameters. Change these to expose parameters of your method to Nextflow (optional)
     - name: "--distance_method"
       type: "string"
       default: "minkowski"
       description: The distance metric to use. Possible values include `euclidean` and `minkowski`.
     - name: "--n_pcs"
       type: "integer"
-      default: 50
+      default: 4
       description: Number of components to use for dimensionality reduction.
+    - name: "--n_neighbors"
+      type: "integer"
+      default: 5
+      description: Number of neighbors to use.
       
   # files your script needs
   resources:
@@ -56,7 +70,7 @@ functionality:
     - type: python_script
       path: test.py
     - path: sample_data
-      
+
 # target platforms
 platforms:
 
@@ -86,3 +100,6 @@ platforms:
   # run your method as part of a nextflow pipeline.
   - type: nextflow
     labels: [ lowmem, lowtime, lowcpu ]
+
+  # used for saturn cloud
+  - type: native

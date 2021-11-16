@@ -127,10 +127,16 @@ class EaRL(torch.nn.Module):
 
         self.atac_zero = MLP(**out_mlp) 
 
+        node_types = ['gene', 'protein', 'protein_name', 'atac_region', 'enhancer', 'tad']
+        self.graph_norm = {node_type: GraphNorm(out_mlp['dim_in']) for node_type in node_types}
+
     def encode(self, x_dict, edge_index_dict):
         for conv in self.convs:
             x_dict = conv(x_dict, edge_index_dict)
             x_dict = {key: x.relu() for key, x in x_dict.items()}
+            for node_type, x in x_dict.items():
+                x_dict[node_type] = self.graph_norm(x)
+
         return x_dict
 
     def gene(self, x_dict, edge_index_dict):
@@ -186,10 +192,13 @@ params = {
               ('SAGEConv', {'out_channels':128}),
               ('SAGEConv', {'out_channels':128}),
               ('SAGEConv', {'out_channels':128}),
+              ('SAGEConv', {'out_channels':128}),
+              ('SAGEConv', {'out_channels':128}),
+              ('SAGEConv', {'out_channels':128}),
               ('SAGEConv', {'out_channels':128})],
               #('TransformerConv', {'out_channels':32, 'heads':2})],
     'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
-               'dim_inner': 512, 'num_layers':3},
+               'dim_inner': 512, 'num_layers':4},
     'train_batch_size': 5,
     'validation_batch_size': 100,
     'checkpoint': 25,

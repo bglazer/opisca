@@ -59,7 +59,6 @@ def expand_for_data(graph):
 def add_expression(graph, cell_idx, task):
     source, target = task
     with torch.no_grad():
-        graph['protein_name'].x = torch.ones((len(node_idxs['protein_name']),1), device=device)*-1
         # 128 is the feature size from the node2vec
         # multiply by 128 so the expression has roughly the same magnitude as 
         # the rest of the features combined
@@ -81,7 +80,7 @@ def add_expression(graph, cell_idx, task):
     
 
 class EaRL(torch.nn.Module):
-    def __init__(self, gnn_layers, out_mlp):
+    def __init__(self, gnn_layers, out_mlp, normalize):
         super().__init__()
 
         self.convs = torch.nn.ModuleList()
@@ -129,15 +128,18 @@ class EaRL(torch.nn.Module):
 
         node_types = ['gene', 'protein', 'protein_name', 'atac_region', 'enhancer', 'tad']
         # TODO not sure why EaRL.to doesnt register the GraphNorm but this might fix it for now
-        self.graph_norm = {node_type: GraphNorm(out_mlp['dim_in']).to(device) for node_type in node_types}
+        if normalize:
+            self.graph_norm = {node_type: GraphNorm(out_mlp['dim_in']).to(device) for node_type in node_types}
+        self.normalize = normalize
         
 
     def encode(self, x_dict, edge_index_dict):
         for conv in self.convs:
             x_dict = conv(x_dict, edge_index_dict)
             x_dict = {key: x.relu() for key, x in x_dict.items()}
-            for node_type, x in x_dict.items():
-                x_dict[node_type] = self.graph_norm[node_type](x)
+            if self.normalize:
+                for node_type, x in x_dict.items():
+                    x_dict[node_type] = self.graph_norm[node_type](x)
 
         return x_dict
 
@@ -190,15 +192,12 @@ print(now, file=log)
 params = {
     'lr':.001,
     'n_steps':15000,
-    'layers':[('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128})],
-    'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
+    'layers':[('SAGEConv', {'out_channels':64}),
+              ('SAGEConv', {'out_channels':64}),
+              ('SAGEConv', {'out_channels':64}),
+              ('SAGEConv', {'out_channels':64}),
+              ('SAGEConv', {'out_channels':64})],
+    'out_mlp':{'dim_in':64, 'dim_out':1, 'bias':True, 
                'dim_inner': 512, 'num_layers':4},
     'train_batch_size': 5,
     'validation_batch_size': 100,
@@ -206,6 +205,7 @@ params = {
     'atac_ones_weight': 1,
     'gene_ones_weight': 1,
     'device': device,
+    'normalize': False,
 }
 
 if log:
@@ -263,11 +263,12 @@ def get_mask(graph, task):
 
 
 print('Initializing EaRL', file=log)
-earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'])
+earl = EaRL(gnn_layers=params['layers'], 
+            out_mlp=params['out_mlp'],
+            normalize=params['normalize'])
 earl = earl.to(device)
 
 optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['lr'])
-earl.train()
 
 n_steps = params['n_steps']
 checkpoint = params['checkpoint']
@@ -313,7 +314,6 @@ def chunks(lst, n):
 
 def compute_loss(prediction, y, target, mask):
     y_zero = y > .00001
-    # TODO normalize loss so that genes/atacs dont swamp protein gradients?
     p_zeros = prediction['p_zero'][mask]
     
     if target == 'atac_region':
@@ -338,7 +338,7 @@ tasks = list(train_cell_idxs.keys())
 
 print('Starting training', file=log)
 for batch_idx in range(n_steps):
-    #task = random.choice(tasks)
+    earl.train()
     optimizer.zero_grad()
     for task in tasks:
         batch = random.sample(train_cell_idxs[task], k=train_batch_size)

@@ -59,7 +59,6 @@ def expand_for_data(graph):
 def add_expression(graph, cell_idx, task):
     source, target = task
     with torch.no_grad():
-        graph['protein_name'].x = torch.ones((len(node_idxs['protein_name']),1), device=device)*-1
         # 128 is the feature size from the node2vec
         # multiply by 128 so the expression has roughly the same magnitude as 
         # the rest of the features combined
@@ -182,13 +181,13 @@ print(now, file=log)
 params = {
     'lr':.001,
     'n_steps':15000,
-    'layers':[('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128})],
+    'layers':[('SAGEConv', {'out_channels':64}),
+              ('SAGEConv', {'out_channels':64}),
+              ('SAGEConv', {'out_channels':64}),
+              ('SAGEConv', {'out_channels':64}),
+              ('SAGEConv', {'out_channels':64})],
               #('TransformerConv', {'out_channels':32, 'heads':2})],
-    'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
+    'out_mlp':{'dim_in':64, 'dim_out':1, 'bias':True, 
                'dim_inner': 512, 'num_layers':3},
     'train_batch_size': 5,
     'validation_batch_size': 100,
@@ -404,7 +403,8 @@ for batch_idx in range(n_steps):
                       f'{float(stacked[0,i]):>7.3f} {float(stacked[1,i]):.3f}', 
                       file=prediction_log, flush=True)
 
-        torch.save(earl.state_dict(), f'models/latest_earl_{now}.model')
+        if log:
+            torch.save(earl.state_dict(), f'models/latest_earl_{now}.model')
         if total_validation_loss < best_validation_loss and log:
             torch.save(earl.state_dict(), f'models/best_earl_{now}.model')
             best_validation_loss = total_validation_loss

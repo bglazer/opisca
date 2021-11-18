@@ -237,7 +237,7 @@ class EaRL(torch.nn.Module):
 now = datetime.strftime(datetime.now(), format='%Y%m%d-%H%M')
 
 # Device is first command line arg
-device='cuda:0'
+device='cuda'
 
 logging.info('Starting')
 logging.info(now)
@@ -245,14 +245,14 @@ logging.info(now)
 tmstp = '20211117-2359'
 logging.info(f'Using EaRL version: {tmstp}')
 
-params = json.load(open(meta['resources_dir'] + f'earl_params_{tmstp}.json'))
+params = json.load(open(meta['resources_dir'] + f'/earl_params_{tmstp}.json'))
 
 logging.info('EaRL parameters:')
 logging.info(pformat(params))
 
 logging.info('Loading graph')
-node_idxs = pickle.load(open('input/nodes_by_type.pickle','rb'))
-graph = torch.load('input/graph_with_embeddings.torch').to(device)
+node_idxs = pickle.load(open(meta['resources_dir'] + '/nodes_by_type.pickle','rb'))
+graph = torch.load(meta['resources_dir'] + '/graph_with_embeddings.torch', map_location='cuda:0').to(device)
 graph = expand_for_data(graph)
 
 expression = {}
@@ -322,10 +322,10 @@ mask = torch.ones((len(node_idxs[target]),1), dtype=bool, device=device)
 predict(earl, graph, task, idx, mask, eval=False)
 
 # TODO make sure this matches the config.vsh.yaml
-earl.load_state_dict(torch.load(meta['resources_dir'] + f'latest_earl_{tmstp}.model'), strict=True)
+earl.load_state_dict(torch.load(meta['resources_dir'] + f'/latest_earl_{tmstp}.model', map_location='cuda:0'), strict=True)
 earl = earl.to(device)
 
-n_steps = 100
+n_steps = 0
 lr = .00001
 
 optimizer = torch.optim.Adam(params=earl.parameters(), lr=lr)

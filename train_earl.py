@@ -196,6 +196,9 @@ params = {
               ('SAGEConv', {'out_channels':64}),
               ('SAGEConv', {'out_channels':64}),
               ('SAGEConv', {'out_channels':64}),
+              ('SAGEConv', {'out_channels':64}),
+              ('SAGEConv', {'out_channels':64}),
+              ('SAGEConv', {'out_channels':64}),
               ('SAGEConv', {'out_channels':64})],
     'out_mlp':{'dim_in':64, 'dim_out':1, 'bias':True, 
                'dim_inner': 512, 'num_layers':4},
@@ -222,12 +225,12 @@ expression = {}
 # match the index of the data to the index of the graph
 graph_idxs = {}
 print('Loading protein/gene data', file=log)
-datadir = 'output/datasets/predict_modality/openproblems_bmmc_cite_phase1_mod2/'
-datafile = 'openproblems_bmmc_cite_phase1_mod2.censor_dataset.output_train_mod1.h5ad'
+datadir = 'output/datasets_phase2/predict_modality/openproblems_bmmc_cite_phase2_mod2/'
+datafile = 'openproblems_bmmc_cite_phase2_mod2.censor_dataset.output_train_mod1.h5ad'
 protein_data = scanpy.read_h5ad(datadir+datafile)
 protein_idxs, protein_expression = proteins_to_idxs(protein_data)
 
-datafile = 'openproblems_bmmc_cite_phase1_mod2.censor_dataset.output_train_mod2.h5ad'
+datafile = 'openproblems_bmmc_cite_phase2_mod2.censor_dataset.output_train_mod2.h5ad'
 gene_data = scanpy.read_h5ad(datadir+datafile)
 gene_idxs, gene_expression = genes_to_idxs(gene_data)
 
@@ -237,12 +240,12 @@ expression[('gene','protein_name')] = (gene_expression,protein_expression)
 graph_idxs[('gene','protein_name')] = (gene_idxs,protein_idxs)
 
 print('Loading atac/gene data', file=log)
-datadir = 'output/datasets/predict_modality/openproblems_bmmc_multiome_phase1_mod2/'
-datafile = 'openproblems_bmmc_multiome_phase1_mod2.censor_dataset.output_train_mod1.h5ad'
+datadir = 'output/datasets_phase2/predict_modality/openproblems_bmmc_multiome_phase2_mod2/'
+datafile = 'openproblems_bmmc_multiome_phase2_mod2.censor_dataset.output_train_mod1.h5ad'
 atac_data = scanpy.read_h5ad(datadir+datafile)
 atac_idxs, atac_expression = atacs_to_idxs(atac_data)
 
-datafile = 'openproblems_bmmc_multiome_phase1_mod2.censor_dataset.output_train_mod2.h5ad'
+datafile = 'openproblems_bmmc_multiome_phase2_mod2.censor_dataset.output_train_mod2.h5ad'
 gene_data = scanpy.read_h5ad(datadir+datafile)
 gene_idxs, gene_expression = genes_to_idxs(gene_data)
 
@@ -255,11 +258,6 @@ print('Making graph undirected', file=log)
 graph = graph.to('cpu')
 graph = torch_geometric.transforms.ToUndirected()(graph)
 graph = graph.to(device)
-
-def get_mask(graph, task):
-    for i,node_type in enumerate(task):
-        graph[node_type]['mask'] = mask
-    return graph
 
 
 print('Initializing EaRL', file=log)

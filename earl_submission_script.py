@@ -31,14 +31,15 @@ method_id = "EaRL-joint"
 ## VIASH START
 # Anything within this block will be removed by `viash` and will be
 # replaced with the parameters as specified in your config.vsh.yaml.
-
 par = {
     'input_train_mod1': 'sample_data/openproblems_bmmc_multiome_starter/openproblems_bmmc_multiome_starter.train_mod1.h5ad',
     'input_train_mod2': 'sample_data/openproblems_bmmc_multiome_starter/openproblems_bmmc_multiome_starter.train_mod2.h5ad',
     'input_test_mod1': 'sample_data/openproblems_bmmc_multiome_starter/openproblems_bmmc_multiome_starter.test_mod1.h5ad',
-    'output': 'output.h5ad',
 }
 
+meta = {
+    'resource_dir': '.',
+}
 ## VIASH END
 
 def proteins_to_idxs(data):
@@ -234,25 +235,10 @@ device='cuda'
 logging.info('Starting')
 logging.info(now)
 
-params = {
-    # TODO lr change for finetuning?
-    'lr':.001,
-    # TODO change nsteps to something more reasonable for finetuning
-    'n_steps':15000,
-    'layers':[('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128}),
-              ('SAGEConv', {'out_channels':128})],
-              #('TransformerConv', {'out_channels':32, 'heads':2})],
-    'out_mlp':{'dim_in':128, 'dim_out':1, 'bias':True, 
-               'dim_inner': 512, 'num_layers':3},
-    'train_batch_size': 5,
-    'checkpoint': 25,
-    'atac_ones_weight': 1,
-    'gene_ones_weight': 1,
-    'device': device,
-}
+tmstp = '20211117_2359'
+logging.info(f'Using EaRL version: {tmstp}')
+
+params = json.load(open(meta['resources_dir'] + f'earl_params_{tmstp}'))
 
 logging.info('EaRL parameters:')
 logging.info(pformat(params))
@@ -313,10 +299,6 @@ graph = graph.to('cpu')
 graph = torch_geometric.transforms.ToUndirected()(graph)
 graph = graph.to(device)
 
-logging.info('Initializing EaRL')
-earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'])
-earl = earl.to(device)
-
 optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['lr'])
 mode = 'train'
 earl.train()
@@ -329,16 +311,11 @@ test_cell_idxs = list(range(len(expression['test'][0])))
 
 train_batch_size = params['train_batch_size']
 
-# TODO 
-# TODO 
-# TODO 
-# load pretrained model
-# TODO 
-# TODO 
-# TODO 
-
-
-
+logging.info('Initializing EaRL')
+earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'])
+# TODO make sure this matches the config.vsh.yaml
+earl.load_state_dict(meta['resources_dir'] + f'latest_earl_{tmstp}.model')
+earl = earl.to(device)
 
 # Finetuning
 #############
@@ -382,10 +359,7 @@ for batch in chunks(test_cell_idxs, test_batch_size)
     for idx in batch:
         prediction = predict(earl, graph, task, idx, mask, eval=True)
 
-    # TODO remap back to original ordering!
-    # TODO remap back to original ordering!
-    # TODO remap back to original ordering!
-    # TODO remap back to original ordering!
+    breakpoint()
 
 
 # Store as sparse matrix to be efficient. Note that this might require

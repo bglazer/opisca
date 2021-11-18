@@ -20,6 +20,7 @@ from torch_geometric.nn import GATConv, HeteroConv, SAGEConv, GATv2Conv, Transfo
 from torch_geometric.data import HeteroData
 from torch_geometric.graphgym.models import MLP
 
+from scipy.sparse import csc_matrix
 import numpy as np
 import scanpy
 import anndata as ad
@@ -32,13 +33,14 @@ method_id = "EaRL-joint"
 # Anything within this block will be removed by `viash` and will be
 # replaced with the parameters as specified in your config.vsh.yaml.
 par = {
-    'input_train_mod1': 'sample_data/openproblems_bmmc_multiome_starter/openproblems_bmmc_multiome_starter.train_mod1.h5ad',
-    'input_train_mod2': 'sample_data/openproblems_bmmc_multiome_starter/openproblems_bmmc_multiome_starter.train_mod2.h5ad',
-    'input_test_mod1': 'sample_data/openproblems_bmmc_multiome_starter/openproblems_bmmc_multiome_starter.test_mod1.h5ad',
+    'input_train_mod1': 'output/datasets_phase1v2/predict_modality/openproblems_bmmc_cite_phase1v2_mod2/openproblems_bmmc_cite_phase1v2_mod2.censor_dataset.output_train_mod1.h5ad',
+    'input_train_mod2': 'output/datasets_phase1v2/predict_modality/openproblems_bmmc_cite_phase1v2_mod2/openproblems_bmmc_cite_phase1v2_mod2.censor_dataset.output_train_mod2.h5ad',
+    'input_test_mod1': 'output/datasets_phase1v2/predict_modality/openproblems_bmmc_cite_phase1v2_mod2/openproblems_bmmc_cite_phase1v2_mod2.censor_dataset.output_test_mod1.h5ad',
+    'output': 'output.h5ad',
 }
 
 meta = {
-    'resource_dir': '.',
+    'resources_dir': './',
 }
 ## VIASH END
 
@@ -81,21 +83,23 @@ def add_expression(graph, cell_idx, task, eval=False):
     source, target = task
 
     with torch.no_grad():
+
         if not eval:
             mode='train'
-            graph[target].y = torch.ones((len(node_idxs[target]),1), device=device)*-1
-            graph[target].y[tgt_idxs[:,1],-1] = tgt_expr[0,tgt_idxs[:,0]]
         else:
             mode='test'
 
-        graph['protein_name'].x = torch.ones((len(node_idxs['protein_name']),1), device=device)*-1
         src_expr = tensor(expression[mode][0][cell_idx].todense(),device=device)*128
-        tgt_expr = tensor(expression[mode][1][cell_idx].todense(),device=device)
-        src_idxs = graph_idxs[mode][0]
-        tgt_idxs = graph_idxs[mode][1]
+        src_idxs = graph_idxs[0]
         graph[source].x[src_idxs[:,1],-1] = src_expr[0,src_idxs[:,0]]
 
-        for node_type in ['gene','atac_region']:
+        if not eval:
+            tgt_idxs = graph_idxs[1]
+            tgt_expr = tensor(expression[mode][1][cell_idx].todense(),device=device)
+            graph[target].y = torch.ones((len(node_idxs[target]),1), device=device)*-1
+            graph[target].y[tgt_idxs[:,1],-1] = tgt_expr[0,tgt_idxs[:,0]]
+
+        for node_type in ['gene','atac_region', 'protein_name']:
             if node_type not in (source, target):
                 graph[node_type].x[:,-1] = torch.ones((len(node_idxs[node_type])), device=device)*-1
 
@@ -106,7 +110,7 @@ def predict(earl, graph, task, idx, mask, eval=False):
     with torch.inference_mode(eval):
         source,target = task
 
-        newgraph = add_expression(graph, idx, task)
+        newgraph = add_expression(graph, idx, task, eval)
         output = earl(newgraph.x_dict, newgraph.edge_index_dict, task)
 
         return output
@@ -201,11 +205,13 @@ class EaRL(torch.nn.Module):
         x_dict['p_zero'] = self.sigmoid(self.gene_zero(x_dict['gene']))
         x_dict['zeros'] = Bernoulli(x_dict['p_zero']).sample()
         x_dict['values'] = self.gene_value(x_dict['gene'])
+        x_dict['prediction'] = x_dict['values'] * x_dict['zeros']
         return x_dict
 
     def atac(self, x_dict, edge_index_dict):
         x_dict = self.encode(x_dict, edge_index_dict)
         x_dict['p_zero'] = self.sigmoid(self.atac_zero(x_dict['atac_region']))
+        x_dict['prediction'] = Bernoulli(x_dict['p_zero']).sample()
         return x_dict
 
     def protein_name(self, x_dict, edge_index_dict):
@@ -213,6 +219,7 @@ class EaRL(torch.nn.Module):
         x_dict['p_zero'] = self.sigmoid(self.protein_zero(x_dict['protein_name']))
         x_dict['zeros'] = Bernoulli(x_dict['p_zero']).sample()
         x_dict['values'] = self.protein_value(x_dict['protein_name'])
+        x_dict['prediction'] = x_dict['values'] * x_dict['zeros']
         return x_dict
     
     def forward(self, x_dict, edge_index_dict, task):
@@ -230,15 +237,15 @@ class EaRL(torch.nn.Module):
 now = datetime.strftime(datetime.now(), format='%Y%m%d-%H%M')
 
 # Device is first command line arg
-device='cuda'
+device='cuda:0'
 
 logging.info('Starting')
 logging.info(now)
 
-tmstp = '20211117_2359'
+tmstp = '20211117-2359'
 logging.info(f'Using EaRL version: {tmstp}')
 
-params = json.load(open(meta['resources_dir'] + f'earl_params_{tmstp}'))
+params = json.load(open(meta['resources_dir'] + f'earl_params_{tmstp}.json'))
 
 logging.info('EaRL parameters:')
 logging.info(pformat(params))
@@ -258,8 +265,8 @@ input_train_mod1 = ad.read_h5ad(par['input_train_mod1'])
 input_train_mod2 = ad.read_h5ad(par['input_train_mod2'])
 input_test_mod1 = ad.read_h5ad(par['input_test_mod1'])
 
-input_modality = input_train_mod1.feature_types.to_list[0]
-output_modality = input_train_mod2.feature_types.to_list[0]
+input_modality = input_train_mod1.var.feature_types.to_list()[0]
+output_modality = input_train_mod2.var.feature_types.to_list()[0]
 
 feature_to_task = {'ATAC': 'atac_region',
                    'GEX': 'gene',
@@ -269,53 +276,60 @@ if input_modality == 'ATAC' and output_modality == 'GEX':
     task = ('atac_region','gene')
     input_idxs, input_expression = atacs_to_idxs(input_train_mod1)
     output_idxs, output_expression = genes_to_idxs(input_train_mod2)
-    test_input_idxs, test_input_expression == atacs_to_idxs(input_test_mod1)
+    _, test_input_expression = atacs_to_idxs(input_test_mod1)
 
 if input_modality == 'ADT' and output_modality == 'GEX':
     task = ('protein_name','gene')
     input_idxs, input_expression = proteins_to_idxs(input_train_mod1)
     output_idxs, output_expression = genes_to_idxs(input_train_mod2)
-    test_input_idxs, test_input_expression == proteins_to_idxs(input_test_mod1)
+    _, test_input_expression = proteins_to_idxs(input_test_mod1)
 
 if input_modality == 'GEX' and output_modality == 'ATAC':
     task = ('gene','atac_region')
     input_idxs, input_expression = genes_to_idxs(input_train_mod1)
     output_idxs, output_expression = atacs_to_idxs(input_train_mod2)
-    test_input_idxs, test_input_expression == genes_to_idxs(input_test_mod1)
+    _, test_input_expression = genes_to_idxs(input_test_mod1)
 
 if input_modality == 'GEX' and output_modality == 'ADT':
     task = ('gene','protein_name')
     input_idxs, input_expression = genes_to_idxs(input_train_mod1)
     output_idxs, output_expression = proteins_to_idxs(input_train_mod2)
-    test_input_idxs, test_input_expression == genes_to_idxs(input_test_mod1)
+    _, test_input_expression = genes_to_idxs(input_test_mod1)
 
 expression['train'] = (input_expression, output_expression)
 expression['test'] = (test_input_expression, None)
-graph_idxs['train'] = (input_idxs, output_idxs)
-graph_idxs['test'] = (test_input_idxs, None)
+graph_idxs = (input_idxs, output_idxs)
 
 logging.info('Making graph undirected')
 graph = graph.to('cpu')
 graph = torch_geometric.transforms.ToUndirected()(graph)
 graph = graph.to(device)
 
-optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['lr'])
-mode = 'train'
-earl.train()
 
-n_steps = params['n_steps']
-checkpoint = params['checkpoint']
-
-train_cell_idxs = list(range(len(expression['train'][0])))
-test_cell_idxs = list(range(len(expression['test'][0])))
+train_cell_idxs = list(range(expression['train'][0].shape[0]))
+test_cell_idxs = list(range(expression['test'][0].shape[0]))
 
 train_batch_size = params['train_batch_size']
 
 logging.info('Initializing EaRL')
 earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'])
-# TODO make sure this matches the config.vsh.yaml
-earl.load_state_dict(meta['resources_dir'] + f'latest_earl_{tmstp}.model')
 earl = earl.to(device)
+
+# Dummy batch so that we can initialize the parameters to the correct shape and load the state dict
+source,target = task
+idx = 0
+mask = torch.ones((len(node_idxs[target]),1), dtype=bool, device=device)
+predict(earl, graph, task, idx, mask, eval=False)
+
+# TODO make sure this matches the config.vsh.yaml
+earl.load_state_dict(torch.load(meta['resources_dir'] + f'latest_earl_{tmstp}.model'), strict=True)
+earl = earl.to(device)
+
+n_steps = 100
+lr = .00001
+
+optimizer = torch.optim.Adam(params=earl.parameters(), lr=lr)
+earl.train()
 
 # Finetuning
 #############
@@ -324,10 +338,11 @@ logging.info('Starting training')
 mode = 'train'
 source,target = task
 for batch_idx in range(n_steps):
+    optimizer.zero_grad()
     batch = random.sample(train_cell_idxs, k=train_batch_size)
     
     mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
-    mask[graph_idxs[mode][1][:,1]] = 1
+    mask[graph_idxs[1][:,1]] = 1
     batch_zero_loss = 0.0
     batch_value_loss = 0.0
     batch_prediction_loss = 0.0
@@ -344,7 +359,7 @@ for batch_idx in range(n_steps):
         batch_prediction_loss += float(prediction_loss)/len(batch)
 
     logging.info(f'Batch={batch_idx}')
-    logging.info(f'train zero one loss {task}={batch_zero_loss}', 
+    logging.info(f'train zero one loss {task}={batch_zero_loss}') 
     logging.info(f'train value loss {task}={batch_value_loss}')
     logging.info(f'train prediction loss {task}={batch_prediction_loss}')
     optimizer.step()
@@ -353,19 +368,20 @@ mode = 'test'
 # Evaluation on test set
 ########################
 logging.info('Starting evaluation')
-for batch in chunks(test_cell_idxs, test_batch_size)
+test_batch_size = 100
+y_pred = torch.zeros((input_test_mod1.shape[0], input_train_mod2.shape[1]), device=device)
+for idx in test_cell_idxs:
     mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
-    mask[graph_idxs[mode][1][:,1]] = 1
-    for idx in batch:
-        prediction = predict(earl, graph, task, idx, mask, eval=True)
-
-    breakpoint()
+    prediction = predict(earl, graph, task, idx, mask, eval=True)
+    y_pred[idx,graph_idxs[1][:,0]] = prediction['prediction'][graph_idxs[1][:,1]].T
+    if idx % test_batch_size == 0:
+        logging.info(f'Done with cell {idx}')
 
 
 # Store as sparse matrix to be efficient. Note that this might require
 # different classifiers/embedders before-hand. Not every class is able
 # to support such data structures.
-y_pred = csc_matrix(y_pred)
+y_pred = csc_matrix(y_pred.cpu().numpy())
 
 adata = ad.AnnData(
     X=y_pred,

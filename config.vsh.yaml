@@ -43,6 +43,9 @@ functionality:
     - type: python_script
       path: earl_submission_script.py
     - path: latest_earl_20211117-2359.model
+    - path: earl_params_20211117-2359.json
+    - path: nodes_by_type.pickle
+    - path: graph_with_embeddings.torch
   
   # resources for unit testing your component
   tests:
@@ -54,7 +57,7 @@ platforms:
   # executable which uses docker in the back end to run your method.
   - type: docker
     # you need to specify a base image that contains at least bash and python
-    image: bglazer/pyg:v1
+    image: bglazer/pyg:v2
     run_args: [ "--gpus all" ]
     # You can specify additional dependencies with 'setup'. 
     # See https://viash.io/docs/reference_config/platform-docker/#setup-list

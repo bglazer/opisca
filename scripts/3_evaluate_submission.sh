@@ -3,7 +3,7 @@
 set -e
 
 # change these parameters if need be
-PIPELINE_VERSION="1.3.0"
+PIPELINE_VERSION="1.3.4"
 
 # ViashSourceDir: return the path of a bash file, following symlinks
 # usage   : ViashSourceDir ${BASH_SOURCE[0]}
@@ -36,10 +36,10 @@ export NXF_VER=21.04.1
 bin/nextflow run \
   openproblems-bio/neurips2021_multimodal_viash \
   -r $PIPELINE_VERSION \
-  -main-script src/match_modality/workflows/evaluate_submission/main.nf \
-  --solutionDir 'output/datasets_phase1v2/match_modality' \
-  --predictions 'output/predictions/match_modality/**.h5ad' \
-  --publishDir 'output/evaluation/match_modality' \
+  -main-script src/predict_modality/workflows/evaluate_submission/main.nf \
+  --solutionDir 'output/datasets_phase1v2/predict_modality' \
+  --predictions 'output/predictions/predict_modality/**.h5ad' \
+  --publishDir 'output/evaluation/predict_modality' \
   -resume \
   -latest
 
@@ -49,4 +49,4 @@ echo ""
 echo "######################################################################"
 echo "##                        Evaluation summary                        ##"
 echo "######################################################################"
-echo "Evaluation results are stored at 'output/evaluation/match_modality'."
+echo "Evaluation results are stored at 'output/evaluation/predict_modality'."

@@ -3,7 +3,7 @@
 set -e
 
 # change these parameters if need be
-PIPELINE_VERSION="1.3.0"
+PIPELINE_VERSION="1.3.4"
 
 # helper functions
 
@@ -73,10 +73,10 @@ echo "Please upload your submission at the link below:"
 echo "  https://eval.ai/web/challenges/challenge-page/1111/submission"
 echo ""
 echo "Or use the command below create a private submission:"
-echo "> evalai challenge 1111 phase 2280 submit --file submission_phase2.zip --large --private"
+echo "> evalai challenge 1111 phase 2279 submit --file submission_phase2.zip --large --private"
 echo ""
 echo "Or this command to create a public one:"
-echo "> evalai challenge 1111 phase 2280 submit --file submission_phase2.zip --large --public"
+echo "> evalai challenge 1111 phase 2279 submit --file submission_phase2.zip --large --public"
 echo ""
 echo "Good luck!"
 echo ""

@@ -3,7 +3,7 @@
 set -e
 
 # change these parameters if need be
-PIPELINE_VERSION="1.3.0"
+PIPELINE_VERSION="1.3.4"
 
 # helper functions
 
@@ -16,6 +16,24 @@ function get_script_dir {
     [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
   done
   cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd
+}
+function aws_sync {
+  CMD="$1"
+  SOURCE="$2"
+  DEST="$3"
+  # use aws cli if installed
+  if command -v aws &> /dev/null; then
+    aws s3 "$CMD" --no-sign-request "$SOURCE" "$DEST"
+  # else use aws docker container instead
+  else
+    docker run \
+      --user $(id -u):$(id -g) \
+      --rm -it \
+      -v $(pwd)/output:/output \
+      -w / \
+      amazon/aws-cli \
+      s3 "$CMD" --no-sign-request "$SOURCE" "$DEST"
+  fi
 }
 
 # get_latest_release: get the version number of the latest release on git
@@ -57,41 +75,19 @@ echo "######################################################################"
 
 # don't sync data when testing the development starter kits
 if [[ $PIPELINE_VERSION != "main_build" ]]; then
-  VERSION_FILE="output/datasets_phase1v2/match_modality/VERSION"
+  VERSION_FILE="output/datasets_phase1v2/predict_modality/VERSION"
 
   # if the data is not found or is from a previous version starter kit,
   # sync from aws to local
   if [[ ! -f $VERSION_FILE || `cat $VERSION_FILE` != $PIPELINE_VERSION ]]; then
-    mkdir -p output/datasets_phase1v2/match_modality/
-    mkdir -p output/datasets_phase2/match_modality/
+    mkdir -p output/datasets_phase1v2/predict_modality/
+    mkdir -p output/datasets_phase2/predict_modality/
 
     # use aws cli if installed
-    if command -v aws &> /dev/null; then
-      aws s3 sync --no-sign-request \
-        s3://openproblems-bio/public/phase1v2-data/match_modality/ \
-        output/datasets_phase1v2/match_modality/
-      aws s3 sync --no-sign-request \
-        s3://openproblems-bio/public/phase2-data/match_modality/ \
-        output/datasets_phase2/match_modality/
-    # else use aws docker container instead
-    else
-      docker run \
-        --user $(id -u):$(id -g) \
-        --rm -it \
-        -v $(pwd)/output:/output \
-        amazon/aws-cli \
-        s3 sync --no-sign-request \
-        s3://openproblems-bio/public/phase1v2-data/match_modality/ \
-        /output/datasets_phase1v2/match_modality/
-      docker run \
-        --user $(id -u):$(id -g) \
-        --rm -it \
-        -v $(pwd)/output:/output \
-        amazon/aws-cli \
-        s3 sync --no-sign-request \
-        s3://openproblems-bio/public/phase2-data/match_modality/ \
-        /output/datasets_phase2/match_modality/
-    fi
+    aws_sync sync "s3://openproblems-bio/public/phase1v2-data/predict_modality/" "output/datasets_phase1v2/predict_modality/"
+    aws_sync sync "s3://openproblems-bio/public/phase2-data/predict_modality/" "output/datasets_phase2/predict_modality/"
+    aws_sync cp "s3://openproblems-bio/public/phase1v2-data/meta.tsv" "output/datasets_phase1v2/meta.tsv"
+    aws_sync cp "s3://openproblems-bio/public/phase2-data/meta.tsv" "output/datasets_phase2/meta.tsv"
 
     echo "$PIPELINE_VERSION" > $VERSION_FILE
   fi
@@ -105,14 +101,14 @@ echo "######################################################################"
 export NXF_VER=21.04.1
 
 # removing previous output
-[ -d output/predictions/match_modality/ ] && rm -r output/predictions/match_modality/
+[ -d output/predictions/predict_modality/ ] && rm -r output/predictions/predict_modality/
 
 bin/nextflow \
   run openproblems-bio/neurips2021_multimodal_viash \
   -r $PIPELINE_VERSION \
-  -main-script src/match_modality/workflows/generate_submission/main.nf \
-  --datasets 'output/datasets_phase1v2/match_modality/**.h5ad' \
-  --publishDir output/predictions/match_modality/ \
+  -main-script src/predict_modality/workflows/generate_submission/main.nf \
+  --datasets 'output/datasets_phase1v2/predict_modality/**.h5ad' \
+  --publishDir output/predictions/predict_modality/ \
   -resume \
   -latest \
   -c scripts/nextflow.config
@@ -140,10 +136,10 @@ echo "Please upload your submission at the link below:"
 echo "  https://eval.ai/web/challenges/challenge-page/1111/submission"
 echo ""
 echo "Or use the command below create a private submission:"
-echo "> evalai challenge 1111 phase 2277 submit --file submission_phase1v2.zip --large --private"
+echo "> evalai challenge 1111 phase 2276 submit --file submission_phase1v2.zip --large --private"
 echo ""
 echo "Or this command to create a public one:"
-echo "> evalai challenge 1111 phase 2277 submit --file submission_phase1v2.zip --large --public"
+echo "> evalai challenge 1111 phase 2276 submit --file submission_phase1v2.zip --large --public"
 echo ""
 echo "Good luck!"
 

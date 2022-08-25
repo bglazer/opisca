@@ -103,10 +103,6 @@ class EaRL(torch.nn.Module):
                 ('protein', 'rev_associated', 'gene'): layer_type(**params, in_channels=(-1,-1)),
                 ('protein', 'is_named', 'protein_name'): layer_type(**params, in_channels=(-1,-1)),
                 ('protein_name', 'rev_is_named', 'protein'): layer_type(**params, in_channels=(-1,-1)),
-                ('enhancer','overlaps','atac_region'): layer_type(**params, in_channels=(-1,-1)),
-                ('atac_region','rev_overlaps','enhancer'): layer_type(**params, in_channels=(-1,-1)),
-                ('enhancer','associated','gene'): layer_type(**params, in_channels=(-1,-1)),
-                ('gene','rev_associated','enhancer'): layer_type(**params, in_channels=(-1,-1)),
                 ('atac_region','neighbors','gene'): layer_type(**params, in_channels=(-1,-1)),
                 ('gene','rev_neighbors','atac_region'): layer_type(**params, in_channels=(-1,-1)),
             })
@@ -173,12 +169,12 @@ params = {
     'n_steps': 30000,
     # TODO figure out how to use attentional aggregation in SAGE Conv. Problem is currently how to tell
     # EaRL to create new aggregation functions for each layer/relation
-    'layers':[('SAGEConv', {'out_channels':32}),
-              ('SAGEConv', {'out_channels':32}),
-              ('SAGEConv', {'out_channels':32}),],
-             #('SAGEConv', {'out_channels':128}),],
+    'layers':[('SAGEConv', {'out_channels':768}),
+              ('SAGEConv', {'out_channels':768}),
+              ('SAGEConv', {'out_channels':768}),],
+             #('SAGEConv', {'out_channels':164}),],
              #('TransformerConv', {'out_channels':32, 'heads':2})],
-    'out_mlp':{'dim_in':32, 'dim_out':1, 'bias':True, 
+    'out_mlp':{'dim_in':768, 'dim_out':1, 'bias':True, 
                'dim_inner': 512, 'num_layers':3},
     'train_batch_size': 500,
     'validation_batch_size': 100,
@@ -194,7 +190,7 @@ if log:
 
 print('Loading graph', file=log)
 node_idxs = pickle.load(open('input/nodes_by_type.pickle','rb'))
-graph = torch.load('input/graph_with_embeddings.torch').to(device)
+graph = torch.load('input/graph_with_embeddings_no_enhancers.torch').to(device)
 graph = expand_for_data(graph)
 
 expression = {}

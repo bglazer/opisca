@@ -17,7 +17,6 @@ from torch_geometric.nn import GATConv, HeteroConv, SAGEConv, GATv2Conv, Transfo
 from torch_geometric.data import HeteroData
 import torch_geometric
 from torch import tensor
-from torch.distributions import Bernoulli
 from torch_geometric.graphgym.models import MLP
 
 
@@ -48,7 +47,7 @@ def atacs_to_idxs(data):
 
 def expand_for_data(graph):
     with torch.no_grad():
-        for node_type in ['gene', 'atac_region']:
+        for node_type in ['gene', 'atac_region', 'protein_name']:
             graph[node_type].x = torch.cat([
                 graph[node_type].x,
                 torch.ones((len(node_idxs[node_type]),1),device=device)
@@ -59,10 +58,7 @@ def expand_for_data(graph):
 def add_expression(graph, cell_idx, task):
     source, target = task
     with torch.no_grad():
-        # 128 is the feature size from the node2vec
-        # multiply by 128 so the expression has roughly the same magnitude as 
-        # the rest of the features combined
-        src_expr = tensor(expression[task][0][cell_idx].todense(),device=device)*128
+        src_expr = tensor(expression[task][0][cell_idx].todense(),device=device)
         tgt_expr = tensor(expression[task][1][cell_idx].todense(),device=device)
         src_idxs = graph_idxs[task][0]
         tgt_idxs = graph_idxs[task][1]
@@ -103,8 +99,8 @@ class EaRL(torch.nn.Module):
                 ('protein', 'coexpressed', 'protein'): layer_type(**params, in_channels=-1),
                 ('protein', 'tf_interacts', 'gene'): layer_type(**params, in_channels=(-1,-1)),
                 ('gene', 'rev_tf_interacts', 'protein'): layer_type(**params, in_channels=(-1,-1)),
-                ('protein', 'rev_associated', 'gene'): layer_type(**params, in_channels=(-1,-1)),
                 ('gene', 'associated', 'protein'): layer_type(**params, in_channels=(-1,-1)),
+                ('protein', 'rev_associated', 'gene'): layer_type(**params, in_channels=(-1,-1)),
                 ('protein', 'is_named', 'protein_name'): layer_type(**params, in_channels=(-1,-1)),
                 ('protein_name', 'rev_is_named', 'protein'): layer_type(**params, in_channels=(-1,-1)),
                 ('enhancer','overlaps','atac_region'): layer_type(**params, in_channels=(-1,-1)),
@@ -113,16 +109,13 @@ class EaRL(torch.nn.Module):
                 ('gene','rev_associated','enhancer'): layer_type(**params, in_channels=(-1,-1)),
                 ('atac_region','neighbors','gene'): layer_type(**params, in_channels=(-1,-1)),
                 ('gene','rev_neighbors','atac_region'): layer_type(**params, in_channels=(-1,-1)),
-
             })
 
             self.convs.append(conv)
 
-        self.protein_zero  = MLP(**out_mlp) 
         self.protein_value = MLP(**out_mlp)
 
         self.gene_value = MLP(**out_mlp) 
-        self.gene_zero  = MLP(**out_mlp) 
 
         self.atac_zero = MLP(**out_mlp) 
 
@@ -134,8 +127,6 @@ class EaRL(torch.nn.Module):
 
     def gene(self, x_dict, edge_index_dict):
         x_dict = self.encode(x_dict, edge_index_dict)
-        x_dict['p_zero'] = self.sigmoid(self.gene_zero(x_dict['gene']))
-        x_dict['zeros'] = Bernoulli(x_dict['p_zero']).sample()
         x_dict['values'] = self.gene_value(x_dict['gene'])
         return x_dict
 
@@ -146,8 +137,6 @@ class EaRL(torch.nn.Module):
 
     def protein_name(self, x_dict, edge_index_dict):
         x_dict = self.encode(x_dict, edge_index_dict)
-        x_dict['p_zero'] = self.sigmoid(self.protein_zero(x_dict['protein_name']))
-        x_dict['zeros'] = Bernoulli(x_dict['p_zero']).sample()
         x_dict['values'] = self.protein_value(x_dict['protein_name'])
         return x_dict
     
@@ -178,18 +167,20 @@ else:
 print('Starting', file=log)
 print(now, file=log)
 
+
 params = {
     'lr':.001,
-    'n_steps':15000,
-    'layers':[('SAGEConv', {'out_channels':64}),
-              ('SAGEConv', {'out_channels':64}),
-              ('SAGEConv', {'out_channels':64}),
-              ('SAGEConv', {'out_channels':64}),
-              ('SAGEConv', {'out_channels':64})],
-              #('TransformerConv', {'out_channels':32, 'heads':2})],
-    'out_mlp':{'dim_in':64, 'dim_out':1, 'bias':True, 
+    'n_steps': 30000,
+    # TODO figure out how to use attentional aggregation in SAGE Conv. Problem is currently how to tell
+    # EaRL to create new aggregation functions for each layer/relation
+    'layers':[('SAGEConv', {'out_channels':32}),
+              ('SAGEConv', {'out_channels':32}),
+              ('SAGEConv', {'out_channels':32}),],
+             #('SAGEConv', {'out_channels':128}),],
+             #('TransformerConv', {'out_channels':32, 'heads':2})],
+    'out_mlp':{'dim_in':32, 'dim_out':1, 'bias':True, 
                'dim_inner': 512, 'num_layers':3},
-    'train_batch_size': 5,
+    'train_batch_size': 500,
     'validation_batch_size': 100,
     'checkpoint': 25,
     'atac_ones_weight': 1,
@@ -255,7 +246,7 @@ print('Initializing EaRL', file=log)
 earl = EaRL(gnn_layers=params['layers'], out_mlp=params['out_mlp'])
 earl = earl.to(device)
 
-optimizer = torch.optim.Adam(params=earl.parameters(), lr=params['lr'])
+optimizer = torch.optim.AdamW(params=earl.parameters(), lr=params['lr'])
 earl.train()
 
 n_steps = params['n_steps']
@@ -281,7 +272,6 @@ bce_loss = BCELoss()
 
 best_validation_loss = float('inf')
 
-# TODO make this take a task as an input variable
 def predict(earl, graph, task, idxs, mask, eval=False):
     source,target = task
     with torch.inference_mode(eval):
@@ -302,26 +292,17 @@ def chunks(lst, n):
 
 def compute_loss(prediction, y, target, mask):
     y_zero = y > .00001
-    # TODO normalize loss so that genes/atacs dont swamp protein gradients?
-    p_zeros = prediction['p_zero'][mask]
     
     if target == 'atac_region':
+        p_zeros = prediction['p_zero'][mask]
         bce_loss = BCELoss(weight=1+y_zero*params['atac_ones_weight'])
         loss = bce_loss(p_zeros, y_zero.float())
-        return loss, loss, 0, loss
+        return loss
 
     if target in ['gene', 'protein_name']:
-        if target=='gene':
-            bce_loss = BCELoss(weight=1+y_zero*params['gene_ones_weight'])
-        else:
-            bce_loss = BCELoss()
         values = prediction['values'][mask]
-        zeros = prediction['zeros'][mask]
-        zero_loss = bce_loss(p_zeros, y_zero.float())
-        value_loss = ((values[y_zero] - y[y_zero])**2).mean()
-        prediction_loss = float(((values*zeros - y)**2).mean())
-        loss = zero_loss + value_loss
-        return loss, prediction_loss, value_loss, zero_loss
+        loss = ((values - y)**2).mean()
+        return loss
 
 tasks = list(train_cell_idxs.keys())
 
@@ -335,23 +316,16 @@ for batch_idx in range(n_steps):
         source,target = task
         mask = torch.zeros((len(node_idxs[target]),1), dtype=bool, device=device)
         mask[graph_idxs[task][1][:,1]] = 1
-        batch_zero_loss = 0.0
-        batch_value_loss = 0.0
         batch_prediction_loss = 0.0
         for idx in batch:
             # only one prediction at a time, minimizes memory usage
             prediction, y = predict(earl, graph, task, [idx], mask)[0]
-            losses = compute_loss(prediction, y[mask], target, mask) 
-            loss, prediction_loss, value_loss, zero_loss = losses
+            loss = compute_loss(prediction, y[mask], target, mask) 
             loss.backward()
 
-            batch_zero_loss += float(zero_loss)/len(batch)
-            batch_value_loss += float(value_loss)/len(batch)
-            batch_prediction_loss += float(prediction_loss)/len(batch)
+            batch_prediction_loss += float(loss)/len(batch)
 
         print(f'Batch={batch_idx}', file=log)
-        print(f'train zero one loss {task}={batch_zero_loss}', file=log) 
-        print(f'train value loss {task}={batch_value_loss}',flush=True, file=log)
         print(f'train prediction loss {task}={batch_prediction_loss}',flush=True, file=log)
     optimizer.step()
 
@@ -371,18 +345,11 @@ for batch_idx in range(n_steps):
 
             idxs = random.sample(validation_cell_idxs[task], k=validation_batch_size)
             validation_loss = 0.0
-            zero_loss = 0.0
-            value_loss = 0.0
             for idx in idxs:
                 prediction, y = predict(earl, graph, task, [idx], mask, eval=True)[0]
                 y = y[mask].flatten()
-                losses = compute_loss(prediction, y, target, mask) 
-                _, _validation_loss, _value_loss, _zero_loss = losses
-                zero_loss += _zero_loss/len(idxs)
-                value_loss += _value_loss/len(idxs)
-                validation_loss += _validation_loss/len(idxs)
-            print(f'validation zero one loss {task}={float(zero_loss)}', file=log) 
-            print(f'validation value loss {task}={float(value_loss)}',flush=True, file=log)
+                loss = compute_loss(prediction, y, target, mask) 
+                validation_loss += float(loss)/len(idxs)
             print(f'validation prediction loss {task}={validation_loss}',flush=True, file=log)
             total_validation_loss += validation_loss
 
@@ -391,9 +358,8 @@ for batch_idx in range(n_steps):
                 stacked = torch.vstack([p_zeros, y])
 
             if target in ['gene', 'protein_name']:
-                zeros = prediction['zeros'][mask]
                 values = prediction['values'][mask]
-                stacked = torch.vstack([values*zeros, y])
+                stacked = torch.vstack([values, y])
 
             print('-'*80, file=prediction_log)
             print(f'Task: {task}', file=prediction_log)
